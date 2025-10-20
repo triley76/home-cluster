@@ -1,15 +1,22 @@
-metadata:
-  namespace: default
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: echo }
+metadata:
+  name: echo
+  namespace: default
+  labels:
+    app: echo
 spec:
   replicas: 1
-  selector: { matchLabels: { app: echo } }
+  selector:
+    matchLabels:
+      app: echo
   template:
-    metadata: { labels: { app: echo } }
+    metadata:
+      labels:
+        app: echo
     spec:
       containers:
-      - name: echo
-        image: ealen/echo-server
-        ports: [{ containerPort: 80 }]
+        - name: echo
+          image: ealen/echo-server
+          ports:
+            - containerPort: 80

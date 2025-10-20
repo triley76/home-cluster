@@ -1,9 +1,13 @@
-metadata:
-  namespace: default
 apiVersion: v1
 kind: Service
-metadata: { name: echo }
+metadata:
+  name: echo
+  namespace: default
 spec:
   type: LoadBalancer
-  selector: { app: echo }
-  ports: [{ name: http, port: 80, targetPort: 80 }]
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
