@@ -1,3 +1,5 @@
+metadata:
+  namespace: default
 apiVersion: v1
 kind: Service
 metadata: { name: echo }
