@@ -4,3 +4,4 @@ resources:
   - metallb.yaml
   - metallb-pool.yaml
   - traefik
+  - longhorn.yaml
