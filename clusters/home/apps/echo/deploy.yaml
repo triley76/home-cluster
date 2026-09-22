@@ -1,22 +1,67 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: echo
-  namespace: default
+  name: platform-canary
   labels:
-    app: echo
+    app.kubernetes.io/name: platform-canary
+    app.kubernetes.io/part-of: home-cluster
 spec:
-  replicas: 1
+  replicas: 2
+  revisionHistoryLimit: 2
   selector:
     matchLabels:
-      app: echo
+      app.kubernetes.io/name: platform-canary
   template:
     metadata:
       labels:
-        app: echo
+        app.kubernetes.io/name: platform-canary
+        app.kubernetes.io/part-of: home-cluster
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: platform-canary
       containers:
-        - name: echo
-          image: ealen/echo-server
+        - name: whoami
+          image: traefik/whoami:v1.12.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8080
+            - --name=home-cluster-canary
           ports:
-            - containerPort: 80
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
