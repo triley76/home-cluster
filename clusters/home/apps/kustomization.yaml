@@ -3,4 +3,4 @@ kind: Kustomization
 
 # Applications are enabled only after their platform dependencies are validated.
 resources:
-  - echo
+  - platform-canary

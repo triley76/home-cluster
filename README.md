@@ -25,12 +25,9 @@ See [MetalLB L2 validation](docs/validation/metallb-l2.md) for the observed test
 
 ### Present but not enabled
 
-The repository contains earlier manifests for:
+The repository contains an earlier Longhorn manifest retained for review but excluded from active reconciliation. Its presence does not mean persistent storage is deployed or validated on V2.
 
-- Longhorn
-- An echo test workload
-
-These manifests are retained for review but are excluded from active reconciliation. Their presence does not mean the associated services are deployed or validated on V2. The obsolete V1 Traefik service patch has been removed; ingress selection and deployment remain planned.
+The obsolete V1 Traefik service patch has been removed; ingress selection and deployment remain planned.
 
 ### Planned
 
@@ -66,7 +63,7 @@ That testing does not establish:
 - Persistent-storage recovery
 - Completed AKS or EKS implementations
 - Completed ingress, observability, or backup services
-- Validation of Longhorn or the dormant echo workload
+- Validation of Longhorn
 
 Claims in this repository are updated only after implementation and validation evidence exists.
 
