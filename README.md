@@ -47,8 +47,8 @@ These manifests are retained for review but are excluded from active reconciliat
 clusters/
 └── home/
     ├── flux-system/       # Flux-generated controllers and synchronization
-    ├── infrastructure/    # Platform services; currently disabled
-    ├── apps/              # Workloads; currently disabled
+    ├── infrastructure/    # Platform services introduced incrementally
+    ├── apps/              # Validated and planned workloads
     └── kustomization.yaml # Cluster reconciliation root
 ```
 
