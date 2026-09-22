@@ -6,7 +6,7 @@ This repository is the desired-state layer of the broader **Enterprise Platform 
 
 ## Current status
 
-The active V2 environment now includes a deliberately introduced networking service and hardened validation workload. Additional platform services remain disabled until they are reviewed and tested individually.
+The active V2 environment includes a deliberately introduced networking service and hardened validation workload. Additional platform services will be added only after they are reviewed and tested individually.
 
 ### Implemented and validated
 
@@ -23,11 +23,6 @@ The active V2 environment now includes a deliberately introduced networking serv
 
 See [MetalLB L2 validation](docs/validation/metallb-l2.md) for the observed test evidence and its limits.
 
-### Present but not enabled
-
-The repository contains an earlier Longhorn manifest retained for review but excluded from active reconciliation. Its presence does not mean persistent storage is deployed or validated on V2.
-
-The obsolete V1 Traefik service patch has been removed; ingress selection and deployment remain planned.
 
 ### Planned
 
@@ -63,7 +58,6 @@ That testing does not establish:
 - Persistent-storage recovery
 - Completed AKS or EKS implementations
 - Completed ingress, observability, or backup services
-- Validation of Longhorn
 
 Claims in this repository are updated only after implementation and validation evidence exists.
 
