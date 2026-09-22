@@ -6,21 +6,27 @@ This repository is the desired-state layer of the broader **Enterprise Platform 
 
 ## Current status
 
-The active V2 baseline has been intentionally reduced to safe reconciliation while platform services are redesigned and validated.
+The active V2 environment now includes a deliberately introduced networking service and hardened validation workload. Additional platform services remain disabled until they are reviewed and tested individually.
 
 ### Implemented and validated
 
 - Flux 2.9.5 controllers installed and healthy.
 - GitRepository and Kustomization reconciliation from `feature/v2-cluster`.
 - Root reconciliation of `clusters/home`.
-- Empty infrastructure and application resource lists used as a safe V2 baseline.
-- Structural Kustomize rendering of the baseline.
+- MetalLB 0.16.1 installed through a Flux-managed HelmRelease.
+- MetalLB configured for L2 advertisement on `ens160`, without the unnecessary FRR-K8s backend.
+- Address pool `10.0.0.220-10.0.0.230` configured outside the router's DHCP scope.
+- Hardened two-replica canary workload exposed through a LoadBalancer service at `10.0.0.220`.
+- LAN reachability and traffic distribution across both canary replicas.
+- MetalLB advertisement migration during one tested announcer-node outage.
+- Node recovery, speaker reintegration, endpoint restoration, and return of L2 ownership.
+
+See [MetalLB L2 validation](docs/validation/metallb-l2.md) for the observed test evidence and its limits.
 
 ### Present but not enabled
 
 The repository contains earlier manifests for:
 
-- MetalLB
 - Longhorn
 - An echo test workload
 
@@ -31,7 +37,6 @@ These manifests are retained for review but are excluded from active reconciliat
 - Explicit ingress-controller selection and validation.
 - Deliberate persistent-storage design.
 - Observability and backup/restore.
-- Hardened canary workload.
 - Platform-specific GitOps overlays for K3s, Azure Kubernetes Service (AKS), and Amazon Elastic Kubernetes Service (EKS).
 - Terraform-managed cloud infrastructure.
 - Application and AIStudio workload integration.
@@ -51,7 +56,7 @@ The structure will evolve as K3s, AKS, and EKS environments are implemented. Sha
 
 ## Validation boundaries
 
-The VMware/K3s platform has separately demonstrated three-node embedded-etcd operation, kube-vip API failover during one tested node outage, workload rescheduling, and node reintegration.
+The VMware/K3s platform has demonstrated three-node embedded-etcd operation, kube-vip API failover during one tested node outage, MetalLB L2 advertisement migration during one tested announcer-node outage, post-failover workload availability through a surviving replica, and node reintegration.
 
 That testing does not establish:
 
@@ -60,7 +65,8 @@ That testing does not establish:
 - Production readiness
 - Persistent-storage recovery
 - Completed AKS or EKS implementations
-- Deployment of the dormant platform-service manifests in this repository
+- Completed ingress, observability, or backup services
+- Validation of Longhorn or the dormant echo workload
 
 Claims in this repository are updated only after implementation and validation evidence exists.
 
