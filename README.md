@@ -21,11 +21,10 @@ The active V2 baseline has been intentionally reduced to safe reconciliation whi
 The repository contains earlier manifests for:
 
 - MetalLB
-- Traefik service configuration
 - Longhorn
 - An echo test workload
 
-These manifests are retained for review but are excluded from active reconciliation. Their presence does not mean the associated services are deployed or validated on V2.
+These manifests are retained for review but are excluded from active reconciliation. Their presence does not mean the associated services are deployed or validated on V2. The obsolete V1 Traefik service patch has been removed; ingress selection and deployment remain planned.
 
 ### Planned
 
