@@ -1,7 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# MetalLB Phase 1 installs the controller and speakers only.
-# Address-pool configuration is enabled after the installation is validated.
+# MetalLB is installed before its L2 address pool is enabled.
 resources:
   - metallb.yaml
+  - metallb-pool.yaml
