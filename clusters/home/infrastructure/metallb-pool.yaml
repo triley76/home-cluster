@@ -13,4 +13,7 @@ metadata:
   name: home-l2
   namespace: metallb-system
 spec:
-  ipAddressPools: [ home-pool ]
+  ipAddressPools:
+    - home-pool
+  interfaces:
+    - ens160
