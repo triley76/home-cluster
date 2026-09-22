@@ -30,4 +30,6 @@ spec:
         kind: HelmRepository
         name: metallb
         namespace: flux-system
-  values: {}
+  values:
+    frrk8s:
+      enabled: false
