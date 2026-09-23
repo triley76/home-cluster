@@ -8,7 +8,7 @@ metadata:
 spec:
   interval: 1m0s
   ref:
-    branch: feature/v2-cluster
+    branch: main
   secretRef:
     name: flux-system
   url: ssh://git@github.com/triley76/home-cluster
