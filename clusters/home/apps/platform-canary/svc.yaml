@@ -4,6 +4,7 @@ metadata:
   name: platform-canary
   annotations:
     metallb.io/address-pool: home-pool
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   type: LoadBalancer
   selector:

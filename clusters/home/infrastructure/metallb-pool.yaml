@@ -3,6 +3,8 @@ kind: IPAddressPool
 metadata:
   name: home-pool
   namespace: metallb-system
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   addresses:
     - 10.0.0.220-10.0.0.230
@@ -12,6 +14,8 @@ kind: L2Advertisement
 metadata:
   name: home-l2
   namespace: metallb-system
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   ipAddressPools:
     - home-pool
