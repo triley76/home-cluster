@@ -11,7 +11,7 @@ The active V2 environment includes a deliberately introduced networking service 
 ### Implemented and validated
 
 - Flux 2.9.5 controllers installed and healthy.
-- GitRepository and Kustomization reconciliation from `feature/v2-cluster`.
+- GitRepository and Kustomization reconciliation from `main`.
 - Root reconciliation of `clusters/home`.
 - MetalLB 0.16.1 installed through a Flux-managed HelmRelease.
 - MetalLB configured for L2 advertisement on `ens160`, without the unnecessary FRR-K8s backend.
