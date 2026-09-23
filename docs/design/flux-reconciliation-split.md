@@ -2,6 +2,8 @@
 
 **Status:** Proposed. Not applied. No live manifests change until this design is reviewed and approved. Each migration phase below is a separate PR.
 
+**Recorded so far (September 23, 2026):** the Phase 0 pre-flight checks were completed, and none of the Phase 0 stop conditions was met. A K3s etcd recovery snapshot was taken, but restoring from it was not tested. The k3d negative control demonstrated the clean-bootstrap ordering defect. See [Phase 0 observed evidence](#phase-0-observed-evidence).
+
 ## Purpose
 
 1. Split the single `flux-system` Kustomization into `infrastructure-controllers`, `infrastructure-configs`, and `apps`. Order them with `dependsOn` so that MetalLB custom resources are never applied before MetalLB's CRDs and webhook exist.
@@ -29,7 +31,7 @@ This does not introduce ingress, storage, secrets management, or cloud overlays.
 | `clusters/home/infrastructure` | MetalLB `HelmRepository`, `HelmRelease`, and the `IPAddressPool`/`L2Advertisement` in **one** Kustomize unit |
 | `clusters/home/apps` | `platform-canary` Namespace, Deployment, Service |
 
-Expected `flux-system` inventory, to be confirmed in Phase 0:
+Expected `flux-system` inventory. Phase 0 confirmed that the live inventory contained exactly these seven entries (see [Phase 0 observed evidence](#phase-0-observed-evidence)):
 
 | Inventory ID | Moves to |
 | --- | --- |
@@ -45,7 +47,7 @@ The `metallb-system` Namespace and everything the chart renders belong to the He
 
 ### Problems
 
-- **Clean-bootstrap ordering (suspected, not demonstrated).** On an empty cluster, the `IPAddressPool` and `L2Advertisement` are validated in the same apply as the `HelmRelease` that installs their CRDs. Flux's server-side dry-run is expected to reject the whole unit, so MetalLB would never install. The live cluster works only because these objects were added in separate commits. Static CI cannot confirm or rule this out. The k3d test's negative control is designed to confirm it.
+- **Clean-bootstrap ordering (demonstrated in k3d).** On an empty cluster, the `IPAddressPool` and `L2Advertisement` are validated in the same apply as the `HelmRelease` that installs their CRDs. The Phase 0 k3d negative control confirmed the consequence: Flux's server-side dry-run rejected the whole unit, so no MetalLB HelmRepository, HelmRelease, or CRDs were created. See the [result](#result-september-23-2026). The live cluster works only because these objects were added in separate commits. Static CI cannot detect this. The demonstration covers k3d only, not a clean bootstrap of the VMware/K3s cluster.
 - **Flux is not self-managed.** Changes to `gotk-components.yaml` or `gotk-sync.yaml` have no effect on the cluster until `flux bootstrap` is run again.
 
 ## Why moving objects is dangerous
@@ -503,7 +505,26 @@ This checks whether the current single-unit layout fails on an empty cluster.
 
 **Record:** the exact error from `kubectl -n flux-system describe kustomizations.kustomize.toolkit.fluxcd.io layout-control`.
 
-**If it does not fail:** update the Problems section. The suspected ordering defect is not real in that form, and Phase 3 becomes an organizational change rather than a bootstrap fix.
+**If it does not fail:** update the Problems section. The ordering defect would not be real in that form, and Phase 3 would become an organizational change rather than a bootstrap fix.
+
+#### Result (September 23, 2026)
+
+The negative control failed as expected. The clean-bootstrap ordering defect is **demonstrated in this k3d test**, not merely suspected.
+
+| Item | Observed |
+| --- | --- |
+| Environment | Disposable k3d v5.9.0 cluster running K3s v1.36.4-k3s1 |
+| Revision under test | `main@sha1:b466e5f63e995e718f20745d429b4e941837ee7c` |
+| GitRepository `flux-system` | `Ready=True` |
+| Kustomization `layout-control` | Stayed `Ready=False` through repeated reconciliation attempts |
+| Failure | Flux server-side dry-run failed: `IPAddressPool` and `L2Advertisement` (`metallb.io/v1beta1`) had no matching kinds |
+| MetalLB `HelmRepository` / `HelmRelease` | Not created |
+| MetalLB CRDs | Not installed |
+| Evidence file | `/home/triley76/flux-split/phase0-k3d-negative-control.txt` (outside this repository) |
+
+**What this result shows:** from an empty k3d cluster, the current single-unit `clusters/home/infrastructure` layout cannot install MetalLB. The server-side dry-run rejects the MetalLB custom resources before the HelmRelease that would install their CRDs is created.
+
+**What this result does not test:** Flux self-bootstrap, VMware networking, kube-vip, `ens160`, ARP, MetalLB L2 advertisement, or LAN reachability.
 
 ### Positive test (Phase 3 pre-merge gate)
 
@@ -523,9 +544,60 @@ This checks whether the current single-unit layout fails on an empty cluster.
 
 **What a pass does not show:** Flux self-bootstrap, VMware networking, kube-vip, L2 announcement, ARP behavior, or LAN reachability.
 
+## Phase 0 observed evidence
+
+All results below were recorded on September 23, 2026. They are the baseline for the before/after comparisons in later phases.
+
+### Live cluster pre-flight
+
+| Check | Observed |
+| --- | --- |
+| Snapshot S | The script from [Snapshot (S)](#snapshot-s) ran successfully. Output is saved on `k3s01` as `~/flux-split/phase0.txt`, outside this repository |
+| Flux source and root Kustomization | GitRepository and `flux-system` Kustomization `Ready=True` at `main@sha1:b466e5f63e995e718f20745d429b4e941837ee7c`, after CI PR #4 merged |
+| `flux-system` inventory | Contained exactly the seven expected moving resources listed under [Current state](#current-state) |
+| Ownership of moving resources | All seven owned by `flux-system`; none carried `kustomize.toolkit.fluxcd.io/prune: disabled` |
+| `deletionPolicy` | The live Kustomization API supports `Orphan` |
+| Flux controller images | Live images exactly matched `gotk-components.yaml`: source-controller v1.9.5, kustomize-controller v1.9.5, helm-controller v1.6.4, notification-controller v1.9.4 |
+| Field managers on `Deployment/platform-canary` | `kustomize-controller` and `k3s`. `kustomize-controller` is the manager to use in the Phase 1 server-side diff |
+| MetalLB | HelmRelease `Ready=True` |
+| Canary | Deployment 2/2 available; LoadBalancer address still `10.0.0.220` |
+| LAN reachability | At about 15:53 EDT, 10 of 10 requests from a Windows LAN workstation to `http://10.0.0.220/` succeeded, with zero recorded failures |
+| Canary hostnames returned | Both replicas responded: `platform-canary-588665dff4-gcthl` and `platform-canary-588665dff4-f5dpg` |
+
+This shows LAN reachability, and traffic distribution across both replicas, at the time of the Phase 0 check. It was a short burst of requests. It was not a continuous transition monitor, it did not measure failover duration, and it is not evidence of zero-downtime behavior.
+
+### Recovery point
+
+A K3s etcd snapshot of the live cluster was taken:
+
+| Item | Value |
+| --- | --- |
+| Snapshot name | `pre-flux-split-phase0-20260923T191128Z-k3s01-1790190688` |
+| SHA-256 | `ed90b6567a714d33c00b2d318420409bce9c83f0f5c0ae727dfed76be56e73f3` |
+
+The snapshot was created and its checksum recorded. **Restoring from it has not been tested**, so it has not been shown to be a working recovery path.
+
+### k3d negative control
+
+The ordering defect was demonstrated in k3d. See [Result (September 23, 2026)](#result-september-23-2026).
+
+### Phase 0 stop conditions
+
+None of the Phase 0 stop conditions was met:
+
+- Flux and MetalLB were Ready. The canary was 2/2 with LoadBalancer address `10.0.0.220`, and 10 of 10 LAN requests to it succeeded, with both replicas responding.
+- The inventory matched the expected table.
+- `Orphan` is supported.
+- The Flux images matched Git.
+- The etcd snapshot was created.
+
+Phase 1 still waits for this design to be reviewed and approved.
+
 ## Evidence boundaries
 
-If Phases 0–4 and the k3d test pass, they show that:
+Already demonstrated: the Phase 0 k3d negative control showed that the current layout cannot install MetalLB from an empty k3d cluster. That result says nothing about the VMware/K3s environment or about the proposed layout.
+
+If Phases 0–4 and the k3d positive test pass, they show that:
 
 - ownership moved in place without recreating any object;
 - Flux manages itself again;
