@@ -1,0 +1,36 @@
+# Local environment and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Credentials and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kubeconfig
+kubeconfig
+kubeconfig.*
+secrets/
+credentials/
+
+# Terraform local state and generated files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log
+crash.*.log
+
+# Temporary and generated output
+tmp/
+temp/
+*.tmp
+*.log
