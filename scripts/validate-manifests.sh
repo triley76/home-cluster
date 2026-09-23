@@ -22,6 +22,23 @@ CRD_SCHEMA_LOCATION="https://raw.githubusercontent.com/datreeio/CRDs-catalog/${C
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Flux reconciles clusters/home, which includes its own components through the
+# flux-system entry. Removing that entry would make Flux garbage-collect its own
+# CRDs and controllers. This is a static root-reference assertion only: it checks
+# that flux-system is a direct list item of the top-level resources: block, and
+# does not show that Flux self-management is healthy.
+root_kustomization="clusters/home/kustomization.yaml"
+if ! awk '
+  { sub(/\r$/, "") }
+  /^resources:[[:space:]]*(#.*)?$/ { in_resources = 1; next }
+  in_resources && /^[^[:space:]#-]/ { in_resources = 0 }
+  in_resources && /^[[:space:]]*-[[:space:]]+flux-system\/?[[:space:]]*(#.*)?$/ { found = 1; exit }
+  END { exit !found }
+' "$root_kustomization"; then
+  echo "::error file=${root_kustomization}::${root_kustomization} must list flux-system as a resource; removing it would make Flux prune its own components"
+  exit 1
+fi
+
 status=0
 while IFS= read -r kfile; do
   dir="$(dirname "$kfile")"
