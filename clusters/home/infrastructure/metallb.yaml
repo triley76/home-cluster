@@ -3,6 +3,8 @@ kind: HelmRepository
 metadata:
   name: metallb
   namespace: flux-system
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   interval: 1h
   url: https://metallb.github.io/metallb
@@ -12,6 +14,8 @@ kind: HelmRelease
 metadata:
   name: metallb
   namespace: flux-system
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   interval: 1h
   targetNamespace: metallb-system
