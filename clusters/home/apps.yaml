@@ -1,0 +1,18 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infrastructure-configs
+  interval: 10m
+  retryInterval: 1m
+  timeout: 5m
+  path: ./clusters/home/apps
+  prune: true
+  wait: true
+  deletionPolicy: Orphan      # migration only; removed in Phase 4
+  sourceRef:
+    kind: GitRepository
+    name: flux-system

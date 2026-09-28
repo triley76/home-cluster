@@ -1,0 +1,35 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure-controllers
+  namespace: flux-system
+spec:
+  interval: 1h
+  retryInterval: 1m
+  timeout: 10m
+  path: ./clusters/home/infrastructure/controllers
+  prune: true
+  wait: true
+  deletionPolicy: Orphan      # migration only; removed in Phase 4
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: infrastructure-configs
+  namespace: flux-system
+spec:
+  dependsOn:
+    - name: infrastructure-controllers
+  interval: 1h
+  retryInterval: 1m
+  timeout: 5m
+  path: ./clusters/home/infrastructure/configs
+  prune: true
+  wait: true
+  deletionPolicy: Orphan      # migration only; removed in Phase 4
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
