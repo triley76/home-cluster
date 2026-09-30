@@ -20,8 +20,15 @@ The active V2 environment includes a deliberately introduced networking service 
 - LAN reachability and traffic distribution across both canary replicas.
 - MetalLB advertisement migration during one tested announcer-node outage.
 - Node recovery, speaker reintegration, endpoint restoration, and return of L2 ownership.
+- Layered Flux reconciliation with `dependsOn`, so MetalLB CRDs exist before MetalLB configuration is applied:
+  - `infrastructure-controllers`
+  - `infrastructure-configs`
+  - `apps`
+- Flux self-management of `clusters/home/flux-system` from the root Kustomization.
+- Ownership transfer of seven live objects to the child Kustomizations with unchanged UIDs and no Helm upgrade.
+- Normal Flux garbage-collection semantics after the temporary migration protections were removed.
 
-See [MetalLB L2 validation](docs/validation/metallb-l2.md) for the observed test evidence and its limits.
+See [MetalLB L2 validation](docs/validation/metallb-l2.md) and [Flux reconciliation-split validation](docs/validation/flux-reconciliation-split.md) for the observed test evidence and its limits.
 
 
 ### Planned
@@ -38,21 +45,37 @@ See [MetalLB L2 validation](docs/validation/metallb-l2.md) for the observed test
 ```text
 clusters/
 └── home/
-    ├── flux-system/       # Flux-generated controllers and synchronization
-    ├── infrastructure/    # Platform services introduced incrementally
-    ├── apps/              # Validated and planned workloads
-    └── kustomization.yaml # Cluster reconciliation root
+    ├── kustomization.yaml      # Root: flux-system, infrastructure.yaml, apps.yaml
+    ├── flux-system/            # Flux-generated controllers and synchronization (self-managed)
+    ├── infrastructure.yaml     # Flux Kustomizations: infrastructure-controllers, infrastructure-configs
+    ├── apps.yaml               # Flux Kustomization: apps (depends on infrastructure-configs)
+    ├── infrastructure/
+    │   ├── controllers/        # MetalLB HelmRepository and HelmRelease
+    │   └── configs/            # MetalLB IPAddressPool and L2Advertisement
+    └── apps/                   # Validated workloads
 ```
+
+Reconciliation order: `flux-system` → `infrastructure-controllers` → `infrastructure-configs` → `apps`. See the [reconciliation-split design](docs/design/flux-reconciliation-split.md).
 
 The structure will evolve as K3s, AKS, and EKS environments are implemented. Shared resources will be separated from environment-specific networking, ingress, storage, and cloud integrations.
 
 ## Validation boundaries
 
-The VMware/K3s platform has demonstrated three-node embedded-etcd operation, kube-vip API failover during one tested node outage, MetalLB L2 advertisement migration during one tested announcer-node outage, post-failover workload availability through a surviving replica, and node reintegration.
+The VMware/K3s platform has demonstrated:
+
+- three-node embedded-etcd operation;
+- kube-vip API failover during one tested node outage;
+- MetalLB L2 advertisement migration during one tested announcer-node outage;
+- post-failover workload availability through a surviving replica;
+- node reintegration.
+
+The Flux reconciliation split was applied in place. No interruption was observed during the Phase 3 migration window, at the LAN monitor's sample rate. The later Phase 4 monitor recorded failures during an unrelated host reboot, as described in the validation record. Clean-bootstrap ordering was tested in k3d only.
 
 That testing does not establish:
 
 - Measured zero-downtime failover
+- Zero-downtime behavior outside the monitored windows
+- A clean bootstrap of the VMware/K3s cluster
 - Two-node or multi-node failure tolerance
 - Production readiness
 - Persistent-storage recovery

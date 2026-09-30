@@ -1,8 +1,13 @@
 # Design: split Flux reconciliation with `dependsOn`
 
-**Status:** Proposed. Not applied. No live manifests change until this design is reviewed and approved. Each migration phase below is a separate PR.
+**Status:** Implemented. Phases 0–4 are complete; each migration phase was delivered as a separate PR. Phase 3 merged as `main@sha1:7f373e2deff6a8666492b1a90475324afd38d174` and Phase 4 as `main@sha1:d716e526a929c406e06214950aefe0def3d2e203`.
 
-**Recorded so far (September 23, 2026):** the Phase 0 pre-flight checks were completed, and none of the Phase 0 stop conditions was met. A K3s etcd recovery snapshot was taken, but restoring from it was not tested. The k3d negative control demonstrated the clean-bootstrap ordering defect. See [Phase 0 observed evidence](#phase-0-observed-evidence).
+**Recorded evidence:**
+
+- Phase 0 (September 23, 2026): the pre-flight checks were completed, and none of the Phase 0 stop conditions was met. A K3s etcd recovery snapshot was taken, but restoring from it was not tested. The k3d negative control demonstrated the clean-bootstrap ordering defect. See [Phase 0 observed evidence](#phase-0-observed-evidence).
+- Phases 3 and 4: the ownership transfer completed with all seven object UIDs unchanged, and normal Flux garbage collection was restored. See [Flux reconciliation-split validation](../validation/flux-reconciliation-split.md).
+
+The sections below keep the design as approved. Descriptions of the current state and procedures reflect the situation before the migration.
 
 ## Purpose
 
@@ -23,6 +28,8 @@ This does not introduce ingress, storage, secrets management, or cloud overlays.
 | Safety | Every phase has explicit stop conditions and rollback commands, listed below. |
 
 ## Current state
+
+This section describes the layout before the migration. The implemented layout is under [Target layout](#target-layout).
 
 | Item | Observed in Git |
 | --- | --- |
@@ -49,6 +56,12 @@ The `metallb-system` Namespace and everything the chart renders belong to the He
 
 - **Clean-bootstrap ordering (demonstrated in k3d).** On an empty cluster, the `IPAddressPool` and `L2Advertisement` are validated in the same apply as the `HelmRelease` that installs their CRDs. The Phase 0 k3d negative control confirmed the consequence: Flux's server-side dry-run rejected the whole unit, so no MetalLB HelmRepository, HelmRelease, or CRDs were created. See the [result](#result-september-23-2026). The live cluster works only because these objects were added in separate commits. Static CI cannot detect this. The demonstration covers k3d only, not a clean bootstrap of the VMware/K3s cluster.
 - **Flux is not self-managed.** Changes to `gotk-components.yaml` or `gotk-sync.yaml` have no effect on the cluster until `flux bootstrap` is run again.
+
+**Resolution:**
+
+- Phase 1 added `flux-system` to the root kustomization, restoring self-management.
+- Phase 3 introduced the ordered layers.
+- The Phase 3 k3d clean-bootstrap test then converged from an empty cluster with the MetalLB CRDs installed before the configs layer applied. That result covers k3d only; see the [validation record](../validation/flux-reconciliation-split.md).
 
 ## Why moving objects is dangerous
 
@@ -591,21 +604,24 @@ None of the Phase 0 stop conditions was met:
 - The Flux images matched Git.
 - The etcd snapshot was created.
 
-Phase 1 still waits for this design to be reviewed and approved.
+At the time of recording, Phase 1 was waiting for this design to be reviewed and approved.
 
 ## Evidence boundaries
 
-Already demonstrated: the Phase 0 k3d negative control showed that the current layout cannot install MetalLB from an empty k3d cluster. That result says nothing about the VMware/K3s environment or about the proposed layout.
+The Phase 0 k3d negative control showed that the pre-migration layout cannot install MetalLB from an empty k3d cluster.
 
-If Phases 0–4 and the k3d positive test pass, they show that:
+Phases 0–4 are complete. Both Phase 3 k3d gates passed before the live merge: the ownership-transfer rehearsal and the clean-bootstrap test. The [validation record](../validation/flux-reconciliation-split.md) holds the observed results. Together they show that:
 
-- ownership moved in place without recreating any object;
-- Flux manages itself again;
+- ownership of the seven objects moved in place, without recreating any object;
+- the root `flux-system` Kustomization, whose path includes `clusters/home/flux-system`, reconciled to `Ready=True` at both merge revisions;
 - the ordered Kustomizations reconcile on the existing cluster;
 - the layout converges from empty in k3d;
-- LAN availability held at the monitor's sample rate during the Phase 3 change window.
+- no interruption was observed during the Phase 3 change window, at the LAN monitor's sample rate;
+- Phase 4 restored normal Flux garbage-collection semantics.
 
-They do **not** show:
+The Phase 4 LAN monitor was not failure-free. It recorded 15 failures out of 84,656 requests: 13 during a later, owner-reported Windows/VMware host reboot that was unrelated to the GitOps change, and 2 isolated timeouts. Details are in the validation record.
+
+These results do **not** show:
 
 - a clean bootstrap of the real VMware/K3s cluster, including kube-vip and MetalLB L2;
 - zero-downtime behavior outside the monitored window;
