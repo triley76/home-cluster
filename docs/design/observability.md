@@ -215,7 +215,9 @@ Summary of the `HelmRelease` values. The exact values file is produced in the im
 - the chart's Prometheus ClusterRole grants `get` on the `/metrics` non-resource URL;
 - MetalLB's metrics endpoint authorizes that permission.
 
-This has not been observed. The k3d rehearsal must show MetalLB targets `up`, with the MetalLB release unchanged. If it does not, MetalLB scraping is dropped from the phase, or redesigned in a design amendment. It is never enabled by changing the MetalLB HelmRelease without a separate review.
+This has not been observed. The k3d rehearsal must show MetalLB targets `up`, with the MetalLB release unchanged.
+
+**MetalLB authentication is designed separately in Phase 4.** The Phase 2 Prometheus token Secret does not solve it: monitor authorization Secret references are namespace-scoped, so a PodMonitor in `metallb-system` cannot reference the Secret in `monitoring`. Phase 4 must design and rehearse how the MetalLB scrape authenticates, rather than assuming that Secret can be reused. If it does not, MetalLB scraping is dropped from the phase, or redesigned in a design amendment. It is never enabled by changing the MetalLB HelmRelease without a separate review.
 
 **TLS verification for MetalLB metrics:**
 
@@ -303,7 +305,7 @@ These limitations are accepted for this design and must stay visible in document
 - **Grafana admin credentials:** a Secret `monitoring/grafana-admin`, with keys `admin-user` and `admin-password`, is created out of band before Grafana is enabled. The password is generated on the operator's workstation and stored in the owner's password manager. The `HelmRelease` references it with `admin.existingSecret`.
   - The Secret is not in any Flux inventory, so Flux will neither create nor prune it. Deleting the `monitoring` namespace would delete it.
   - Migrating it to an encrypted or external secret workflow is part of the pending secret-management work in [SECURITY.md](../../SECURITY.md).
-- **Chart-generated secrets** (for example, Alertmanager configuration and the admission-webhook certificates) are created in the cluster and never exported to Git.
+- **Chart-generated secrets** (for example, Alertmanager configuration, the admission-webhook certificates and the Prometheus ServiceAccount token Secret described below) are created in the cluster and never exported to Git.
 - **Exposure:** none on the LAN.
   - Grafana, Prometheus and Alertmanager are `ClusterIP`, reached with `kubectl port-forward` by someone who already holds cluster credentials.
   - Grafana still requires its admin login.
@@ -312,6 +314,18 @@ These limitations are accepted for this design and must stay visible in document
   - Prometheus receives the chart's standard cluster-wide read access for discovery.
   - kube-state-metrics receives read access to the Flux custom resources it reports on.
   - No write access to cluster resources is added.
+
+### Prometheus ServiceAccount token Secret (accepted Phase 2 risk)
+
+Phase 2 sets `prometheus.serviceAccount.createTokenSecret: true` explicitly, rather than relying on the chart default.
+
+- **Why it is needed:** chart 91.8.2's kube-apiserver and kubelet ServiceMonitors authenticate with this Secret. With it disabled, the chart refuses to render unless each control-plane ServiceMonitor's authorization is replaced or removed, and those endpoints require authentication on K3s.
+- **Accepted risk:** it is a long-lived `kubernetes.io/service-account-token` Secret for the Prometheus ServiceAccount. It does not expire or rotate. This is an explicitly accepted Phase 2 risk.
+- **Handling:** it exists only in the cluster. It is never committed to Git, and its contents are never captured in rehearsal or validation evidence; evidence records only its namespace, name, type and ServiceAccount annotation.
+- **Projected token unchanged:** Prometheus still receives its normal projected, rotating ServiceAccount token for in-pod Kubernetes API access, such as service discovery.
+- **Rejected for now:** replacing the chart's kubelet and API-server ServiceMonitors with custom `additionalScrapeConfigs` that read the projected token. That would duplicate the chart's discovery and relabeling behavior, which this repository would then have to maintain.
+- **Revisit:** reconsider this decision at a future chart upgrade, if the chart supports projected-token-compatible monitoring.
+- **Not a MetalLB solution:** the Secret references a PodMonitor or ServiceMonitor uses for authorization are namespace-scoped. This Secret lives in `monitoring` and cannot be assumed usable from a monitor in `metallb-system`. Phase 4 designs and rehearses MetalLB authentication separately (see [Scrape targets](#scrape-targets)).
 
 ### Pod Security and node-exporter
 
@@ -326,6 +340,8 @@ The candidate chart exposes `prometheus-node-exporter.namespaceOverride`. Whethe
 - the default node alert and recording rules and the node dashboards still receive data;
 - no other component needs `privileged`, and `monitoring` admits every other pod at the chosen level;
 - uninstalling or pruning cleans up both namespaces as expected.
+
+**Selected for Phase 2:** the dedicated namespace `monitoring-node-exporter`, set through `prometheus-node-exporter.namespaceOverride`, with Pod Security `enforce`, `audit` and `warn` all `privileged`. This is approved because the namespace is dedicated exclusively to node-exporter. The Phase 2 k3d rehearsal must prove that nothing else renders or runs there, together with the checks above. `monitoring` stays `restricted` for `enforce`, `audit` and `warn`.
 
 **Fallback: a namespace-wide exception, only with explicit approval.** If isolation cannot be shown to work safely:
 

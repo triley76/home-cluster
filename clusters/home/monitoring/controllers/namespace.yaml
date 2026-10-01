@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Selected Phase 2 Pod Security approach (docs/design/observability.md): a namespace
+# dedicated exclusively to node-exporter, which needs hostNetwork, hostPID and hostPath.
+# enforce, audit and warn are all privileged; this is approved because nothing else
+# runs here, which the k3d rehearsal must prove before merge.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring-node-exporter
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
