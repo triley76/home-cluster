@@ -1,0 +1,141 @@
+# Required explicit image pins for the kube-prometheus-stack HelmRelease values.
+#
+# Derived from kube-prometheus-stack 91.8.2 (values.yaml and rendered output). Every
+# entry whose `when` conditions hold must be set explicitly in the HelmRelease
+# spec.values with exactly these registry, repository and tag values. Conditions
+# use the chart default when the value is not set.
+#
+# `ref` is the complete image reference the chart renders from those values. CI
+# requires that:
+#   - the "Versions (candidate)" table row named by `design_row` in
+#     docs/design/observability.md contains `ref` exactly (in backticks), so the
+#     design is the approval source; and
+#   - the rendered chart contains `ref`, so the pinned values produce the approved
+#     image. (node-exporter appends -distroless to the tag by chart default.)
+# An entry whose reference is not approved in the design fails as soon as its
+# component is enabled.
+#
+# Not pinned, because the image is not used by any enabled component:
+#   prometheusOperator.thanosImage (operator default only; no Thanos sidecar),
+#   thanosRuler, crds.upgradeJob, prometheus-windows-exporter, grafana
+#   downloadDashboardsImage and imageRenderer (all disabled by default).
+pins:
+  - path: prometheusOperator.image
+    registry: quay.io
+    repository: prometheus-operator/prometheus-operator
+    tag: v0.94.1
+    ref: quay.io/prometheus-operator/prometheus-operator:v0.94.1
+    when:
+      - {path: prometheusOperator.enabled, default: true}
+    design_row: "| Prometheus Operator |"
+
+  - path: prometheusOperator.prometheusConfigReloader.image
+    registry: quay.io
+    repository: prometheus-operator/prometheus-config-reloader
+    tag: v0.94.1
+    ref: quay.io/prometheus-operator/prometheus-config-reloader:v0.94.1
+    when:
+      - {path: prometheusOperator.enabled, default: true}
+    design_row: "| Prometheus config-reloader |"
+
+  - path: prometheusOperator.admissionWebhooks.patch.image
+    registry: ghcr.io
+    repository: jkroepke/kube-webhook-certgen
+    tag: 1.8.9
+    ref: ghcr.io/jkroepke/kube-webhook-certgen:1.8.9
+    when:
+      - {path: prometheusOperator.enabled, default: true}
+      - {path: prometheusOperator.admissionWebhooks.enabled, default: true}
+      - {path: prometheusOperator.admissionWebhooks.patch.enabled, default: true}
+    design_row: "| Webhook certificate Jobs |"
+
+  # Disabled by default (admissionWebhooks.deployment.enabled: false).
+  - path: prometheusOperator.admissionWebhooks.deployment.image
+    registry: quay.io
+    repository: prometheus-operator/admission-webhook
+    tag: v0.94.1
+    ref: quay.io/prometheus-operator/admission-webhook:v0.94.1
+    when:
+      - {path: prometheusOperator.enabled, default: true}
+      - {path: prometheusOperator.admissionWebhooks.enabled, default: true}
+      - {path: prometheusOperator.admissionWebhooks.deployment.enabled, default: false}
+    design_row: "| Operator admission webhook |"
+
+  - path: prometheus.prometheusSpec.image
+    registry: quay.io
+    repository: prometheus/prometheus
+    tag: v3.15.0-distroless
+    ref: quay.io/prometheus/prometheus:v3.15.0-distroless
+    when:
+      - {path: prometheus.enabled, default: true}
+    design_row: "| Prometheus |"
+
+  - path: alertmanager.alertmanagerSpec.image
+    registry: quay.io
+    repository: prometheus/alertmanager
+    tag: v0.34.1
+    ref: quay.io/prometheus/alertmanager:v0.34.1
+    when:
+      - {path: alertmanager.enabled, default: true}
+    design_row: "| Alertmanager |"
+
+  - path: kube-state-metrics.image
+    registry: registry.k8s.io
+    repository: kube-state-metrics/kube-state-metrics
+    tag: v2.20.0
+    ref: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+    when:
+      - {path: kubeStateMetrics.enabled, default: true}
+    design_row: "| kube-state-metrics (subchart"
+
+  # The chart default renders the distroless variant: tag v1.12.1 + "-distroless".
+  - path: prometheus-node-exporter.image
+    registry: quay.io
+    repository: prometheus/node-exporter
+    tag: v1.12.1
+    ref: quay.io/prometheus/node-exporter:v1.12.1-distroless
+    when:
+      - {path: nodeExporter.enabled, default: true}
+    design_row: "| node-exporter (subchart"
+
+  - path: grafana.image
+    registry: docker.io
+    repository: grafana/grafana
+    tag: 13.2.3-distroless
+    ref: docker.io/grafana/grafana:13.2.3-distroless
+    when:
+      - {path: grafana.enabled, default: true}
+    design_row: "| Grafana (subchart"
+
+  - path: grafana.sidecar.image
+    registry: quay.io
+    repository: kiwigrid/k8s-sidecar
+    tag: 2.11.2
+    ref: quay.io/kiwigrid/k8s-sidecar:2.11.2
+    when:
+      - {path: grafana.enabled, default: true}
+    design_row: "| Grafana sidecar |"
+
+  # Rendered only with Grafana persistence (permissions initializer for the claim).
+  - path: grafana.initChownData.image
+    registry: docker.io
+    repository: library/busybox
+    tag: 1.38.0
+    ref: docker.io/library/busybox:1.38.0
+    when:
+      - {path: grafana.enabled, default: true}
+      - {path: grafana.persistence.enabled, default: false}
+      - {path: grafana.initChownData.enabled, default: true}
+    design_row: "| Grafana init (chown) |"
+
+  # Helm test Pod. The design disables it (grafana.testFramework.enabled: false) and
+  # approves no image, so enabling it fails CI.
+  - path: grafana.testFramework.image
+    registry: docker.io
+    repository: bats/bats
+    tag: 1.14.0
+    ref: docker.io/bats/bats:1.14.0
+    when:
+      - {path: grafana.enabled, default: true}
+      - {path: grafana.testFramework.enabled, default: true}
+    design_row: "| Grafana test framework |"

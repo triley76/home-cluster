@@ -159,24 +159,29 @@ Immediately before the first implementation PR:
 3. Re-read its image defaults from the chart package.
 4. Update this table in the implementation PR.
 
-| Item | Candidate (2026-09-30) |
+Observability Phase 1 (CI) selected chart `91.8.2` for validation on 2026-09-30. This table is the **approval source for every image reference**: CI requires each enabled image to be pinned explicitly in the `HelmRelease` values (see `scripts/observability-image-pins.yaml`) and to render exactly the full reference approved here.
+
+| Item | Approved reference (2026-09-30) |
 | --- | --- |
 | Chart `kube-prometheus-stack` | `91.8.2` (published 2026-09-29; package SHA-256 `dbd50ecc4b3c4a0231d8a7c766d4fd8690be4bf2230acb572849fae129797a23`) |
-| Prometheus Operator / config-reloader | `v0.94.1` |
-| Operator admission webhook | `quay.io/prometheus-operator/admission-webhook`, tag defaults to the operator version |
+| Prometheus Operator | `quay.io/prometheus-operator/prometheus-operator:v0.94.1` |
+| Prometheus config-reloader | `quay.io/prometheus-operator/prometheus-config-reloader:v0.94.1` |
+| Operator admission webhook | `quay.io/prometheus-operator/admission-webhook:v0.94.1` (only if `admissionWebhooks.deployment.enabled`; not used by this design) |
 | Webhook certificate Jobs | `ghcr.io/jkroepke/kube-webhook-certgen:1.8.9` |
 | Prometheus | `quay.io/prometheus/prometheus:v3.15.0-distroless` |
 | Alertmanager | `quay.io/prometheus/alertmanager:v0.34.1` |
-| Grafana (subchart `13.2.7`) | `grafana/grafana:13.2.3-distroless` |
+| Grafana (subchart `13.2.7`) | `docker.io/grafana/grafana:13.2.3-distroless` |
 | Grafana sidecar | `quay.io/kiwigrid/k8s-sidecar:2.11.2` |
+| Grafana init (chown) | `docker.io/library/busybox:1.38.0` (Grafana `initChownData`, kept for the `local-path` claim; see rehearsal item 8) |
+| Grafana test framework | Not deployed: `grafana.testFramework.enabled: false` (no image approved) |
 | kube-state-metrics (subchart `8.6.0`) | `registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0` |
-| node-exporter (subchart `4.59.0`) | `quay.io/prometheus/node-exporter:v1.12.1` |
+| node-exporter (subchart `4.59.0`) | `quay.io/prometheus/node-exporter:v1.12.1-distroless` (chart default distroless variant) |
 
-Whichever version is chosen:
+Rules for this table:
 
 - The chart version is pinned exactly.
-- Image tags are also set explicitly in the `HelmRelease` values, so every image change is visible in review.
-- Any later chart upgrade updates both, in the same PR.
+- Every image is pinned explicitly in the `HelmRelease` values (registry, repository and tag), so every image change is visible in review.
+- Any later chart upgrade updates the chart pin, the image pins and this table in the same PR.
 
 ## Proposed configuration
 
@@ -189,7 +194,7 @@ Summary of the `HelmRelease` values. The exact values file is produced in the im
 | Selectors | `podMonitorSelectorNilUsesHelmValues`, `serviceMonitorSelectorNilUsesHelmValues`, `ruleSelectorNilUsesHelmValues` set to `false`, so objects in `monitoring-configs` are selected without the Helm release label |
 | Prometheus | 1 replica, `retention: 7d`, `retentionSize: 8GB`, `walCompression: true`, `volumeClaimTemplate` on `local-path` requesting 10 GiB, default 30 s scrape and evaluation intervals |
 | Alertmanager | 1 replica, `emptyDir` storage, default configuration with the `null` receiver |
-| Grafana | 1 replica, persistence on `local-path` 1 GiB, `admin.existingSecret` referencing an out-of-band Secret, no plugins, anonymous access disabled, dashboard sidecar enabled |
+| Grafana | 1 replica, persistence on `local-path` 1 GiB, `admin.existingSecret` referencing an out-of-band Secret, no plugins, anonymous access disabled, dashboard sidecar enabled, `initChownData` kept, `testFramework.enabled: false` (Helm test Pods are not used; CI and the rehearsal provide validation) |
 | Services | Grafana, Prometheus and Alertmanager all `ClusterIP`. No `LoadBalancer` Service and no MetalLB address in this design |
 | kube-state-metrics | 1 replica. Custom Resource State configuration exporting Flux resources as `gotk_resource_info`, as recommended by the Flux monitoring documentation, with RBAC `extraRules` for the Flux CRDs |
 | node-exporter | DaemonSet on all three nodes; chart defaults `hostNetwork`, `hostPID`, and a read-only root filesystem mount. Namespace placement per [Pod Security](#pod-security-and-node-exporter) |
@@ -422,7 +427,7 @@ It must show:
 5. **Flux assertion:** `gotk_resource_info` reports every Flux Kustomization, GitRepository, and HelmRelease, with the expected label values.
 6. **Metric-name assertion:** every platform rule expression returns data, or is removed. All PrometheusRules load without errors, and deleting a canary pod raises the expected alert state.
 7. **node-exporter isolation:** the checks listed under [Pod Security](#pod-security-and-node-exporter), with the outcome recorded either way.
-8. Grafana answers through `kubectl port-forward` and loads the provisioned dashboards. No `LoadBalancer` Service exists in the `monitoring` namespaces. The Grafana claim's behavior when Grafana is disabled, and when the release is uninstalled, is recorded (see [Rollback](#rollback)).
+8. Grafana answers through `kubectl port-forward` and loads the provisioned dashboards. No `LoadBalancer` Service exists in the `monitoring` namespaces. The Grafana claim's behavior when Grafana is disabled, and when the release is uninstalled, is recorded (see [Rollback](#rollback)). The rehearsal also records whether the fresh `local-path` claim actually needs the `initChownData` permissions initializer (initial ownership of the claim directory, and whether Grafana starts with the initializer disabled). The initializer is removed later only with evidence that Grafana starts successfully on a fresh claim without it.
 9. **Independence:** run two cases, `monitoring` suspended, and separately `monitoring` deliberately failing (for example, an invalid chart version on a test branch). In both cases, the rehearsal must show that `apps` and `infrastructure-*`:
    - reconcile a new revision independently;
    - remain `Ready`;
