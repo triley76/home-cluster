@@ -1,0 +1,17 @@
+# CI SELF-TEST FIXTURE ONLY. Not deployed; proves the promtool check path.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ci-fixture
+  namespace: monitoring
+spec:
+  groups:
+    - name: ci-fixture
+      rules:
+        - alert: CIFixtureAlwaysFalse
+          expr: vector(0) > 1
+          for: 5m
+          labels:
+            severity: none
+          annotations:
+            summary: CI self-test fixture rule; never deployed.
