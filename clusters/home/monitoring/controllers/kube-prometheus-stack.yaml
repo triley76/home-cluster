@@ -1,0 +1,137 @@
+# kube-prometheus-stack, observability Phase 2 (docs/design/observability.md).
+# Grafana is disabled until Phase 3. Every enabled image is pinned explicitly; CI
+# checks each pin against scripts/observability-image-pins.yaml and the design.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kube-prometheus-stack
+  namespace: flux-system
+spec:
+  interval: 1h
+  timeout: 10m
+  targetNamespace: monitoring
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 3
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      version: "91.8.2"
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: flux-system
+  values:
+    # K3s embeds these components without scrapeable metrics endpoints.
+    kubeEtcd:
+      enabled: false
+    kubeControllerManager:
+      enabled: false
+    kubeScheduler:
+      enabled: false
+    kubeProxy:
+      enabled: false
+    defaultRules:
+      rules:
+        etcd: false
+        kubeControllerManager: false
+        kubeSchedulerAlerting: false
+        kubeSchedulerRecording: false
+        kubeProxy: false
+
+    prometheusOperator:
+      image:
+        registry: quay.io
+        repository: prometheus-operator/prometheus-operator
+        tag: v0.94.1
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {cpu: 200m, memory: 256Mi}
+      prometheusConfigReloader:
+        image:
+          registry: quay.io
+          repository: prometheus-operator/prometheus-config-reloader
+          tag: v0.94.1
+        resources:
+          requests: {cpu: 10m, memory: 32Mi}
+          limits: {cpu: 50m, memory: 64Mi}
+      # Admission webhooks stay enabled (chart default) per the design.
+      admissionWebhooks:
+        patch:
+          image:
+            registry: ghcr.io
+            repository: jkroepke/kube-webhook-certgen
+            tag: 1.8.9
+
+    prometheus:
+      # Explicitly accepted Phase 2 risk (docs/design/observability.md): chart 91.8.2's
+      # kube-apiserver and kubelet ServiceMonitors authenticate with this long-lived
+      # ServiceAccount token Secret. It exists only in the cluster, never in Git.
+      serviceAccount:
+        createTokenSecret: true
+      prometheusSpec:
+        image:
+          registry: quay.io
+          repository: prometheus/prometheus
+          tag: v3.15.0-distroless
+        replicas: 1
+        retention: 7d
+        retentionSize: 8GB
+        walCompression: true
+        # Select PodMonitors, ServiceMonitors and PrometheusRules without the Helm release label.
+        podMonitorSelectorNilUsesHelmValues: false
+        serviceMonitorSelectorNilUsesHelmValues: false
+        ruleSelectorNilUsesHelmValues: false
+        resources:
+          requests: {cpu: 200m, memory: 1Gi}
+          limits: {cpu: "1", memory: 2Gi}
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 10Gi
+
+    alertmanager:
+      alertmanagerSpec:
+        image:
+          registry: quay.io
+          repository: prometheus/alertmanager
+          tag: v0.34.1
+        replicas: 1
+        # emptyDir storage (chart default); no notification receiver yet.
+        resources:
+          requests: {cpu: 25m, memory: 64Mi}
+          limits: {cpu: 100m, memory: 128Mi}
+
+    kube-state-metrics:
+      image:
+        registry: registry.k8s.io
+        repository: kube-state-metrics/kube-state-metrics
+        tag: v2.20.0
+      resources:
+        requests: {cpu: 25m, memory: 64Mi}
+        limits: {cpu: 100m, memory: 256Mi}
+
+    prometheus-node-exporter:
+      # Preferred Pod Security isolation; see namespace.yaml.
+      namespaceOverride: monitoring-node-exporter
+      image:
+        registry: quay.io
+        repository: prometheus/node-exporter
+        tag: v1.12.1
+      resources:
+        requests: {cpu: 25m, memory: 32Mi}
+        limits: {cpu: 100m, memory: 64Mi}
+
+    grafana:
+      enabled: false
+      testFramework:
+        enabled: false
