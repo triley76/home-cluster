@@ -239,19 +239,21 @@ This has not been observed. The k3d rehearsal must show MetalLB targets `up`, wi
 | Prometheus config-reloader | 1 | 10m / 50m | 32 MiB / 64 MiB |
 | Prometheus Operator | 1 | 50m / 200m | 64 MiB / 256 MiB |
 | Alertmanager (+ reloader) | 1 | 35m / 150m | 96 MiB / 192 MiB |
-| Grafana (+ 2 sidecars) | 1 | 70m / 300m (Grafana 50m / 200m; each sidecar 10m / 50m) | 192 MiB / 640 MiB (Grafana 128 / 512; each sidecar 32 / 64) |
+| Grafana (+ 2 sidecars) | 1 | 70m / 300m (Grafana 50m / 200m; each sidecar 10m / 50m) | 256 MiB / 1 GiB (Grafana 128 / 512; each sidecar 64 / 256) |
 | kube-state-metrics | 1 | 25m / 100m | 64 MiB / 256 MiB |
 | node-exporter | 3 | 25m / 100m each | 32 MiB / 64 MiB each |
-| **Total** | | **≈ 465m / ≈ 2.1 CPU** | **≈ 1.5 GiB / ≈ 3.6 GiB** |
+| **Total** | | **≈ 465m / ≈ 2.1 CPU** | **≈ 1.6 GiB / ≈ 3.9 GiB** |
 
 The admission-webhook certificate Jobs are short-lived and not included.
+
+The Grafana sidecar memory was raised from 32/64 MiB to 64/256 MiB after the first Phase 3 k3d rehearsal (`k3d-obs-p3-clean-20261008T172438Z`) showed both sidecars `OOMKilled` at a 64 MiB limit, so no dashboards or datasources were provisioned. 256 MiB is provisional: the next rehearsal records per-container memory, and the limit is resized from observed usage.
 
 As a share of the cluster's 12 CPUs and about 23.3 GiB of memory:
 
 | Measure | CPU | Memory |
 | --- | --- | --- |
 | Requests | about 4% | about 7% |
-| Limits | about 18% | about 15% |
+| Limits | about 18% | about 17% |
 
 Current use is 15–19% memory per node. The node hosting Prometheus is expected to rise by about 1–2 GiB.
 

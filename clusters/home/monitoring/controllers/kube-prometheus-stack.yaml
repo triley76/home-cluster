@@ -175,9 +175,11 @@ spec:
           registry: quay.io
           repository: kiwigrid/k8s-sidecar
           tag: 2.11.2
+        # Applies to both sidecars. 64Mi limits were OOM-killed in the k3d rehearsal
+        # (k3d-obs-p3-clean-20261008T172438Z); 256Mi pending observed usage.
         resources:
-          requests: {cpu: 10m, memory: 32Mi}
-          limits: {cpu: 50m, memory: 64Mi}
+          requests: {cpu: 10m, memory: 64Mi}
+          limits: {cpu: 50m, memory: 256Mi}
         dashboards:
           resource: configmap
           # null removes the chart's "ALL": watch only the pod's own namespace.
