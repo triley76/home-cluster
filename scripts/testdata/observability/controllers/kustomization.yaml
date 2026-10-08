@@ -1,0 +1,8 @@
+# CI SELF-TEST FIXTURE ONLY. Membership of the fixture controllers layer, as in
+# clusters/home/monitoring/controllers/kustomization.yaml: the validator renders this
+# Kustomization to decide which custom RBAC Flux would apply.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - kube-prometheus-stack.yaml

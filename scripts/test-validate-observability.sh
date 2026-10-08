@@ -87,24 +87,226 @@ case_run "rendered chart contains the approved node-exporter distroless referenc
 case_run "known chart lint finding is accepted as a warning" pass \
   "::warning::known chart lint finding accepted (" "$d"
 
-GRAFANA_PHASE3='doc["spec"]["values"]["grafana"] = {
+# edit_docs <file> <python statements>: edit all documents, available as the list `docs`.
+edit_docs() {
+  python3 - "$1" "$2" <<'PY'
+import sys, yaml
+path, code = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    docs = list(yaml.safe_load_all(f))
+exec(code, {"docs": docs})
+with open(path, "w") as f:
+    yaml.safe_dump_all(docs, f, sort_keys=False)
+PY
+}
+
+# Grafana as approved for observability Phase 3: approved images, no root init container,
+# no chart RBAC, and sidecars confined to ConfigMaps in the release namespace.
+GRAFANA_APPROVED='doc["spec"]["values"]["grafana"] = {
     "enabled": True,
     "image": {"registry": "docker.io", "repository": "grafana/grafana", "tag": "13.2.3-distroless"},
-    "sidecar": {"image": {"registry": "quay.io", "repository": "kiwigrid/k8s-sidecar", "tag": "2.11.2"}},
-    "initChownData": {"image": {"registry": "docker.io", "repository": "library/busybox", "tag": "1.38.0"}},
+    "sidecar": {"image": {"registry": "quay.io", "repository": "kiwigrid/k8s-sidecar", "tag": "2.11.2"},
+                "dashboards": {"resource": "configmap", "searchNamespace": None},
+                "datasources": {"resource": "configmap"}},
+    "initChownData": {"enabled": False},
+    "rbac": {"create": False},
     "persistence": {"enabled": True, "storageClassName": "local-path", "size": "1Gi"},
     "testFramework": {"enabled": False}}'
-d="$(new_dir grafana-phase3)"
-edit_yaml "$(hr "$d")" "$GRAFANA_PHASE3"
-case_run "Phase 3-shaped Grafana values with approved images, including busybox" pass \
-  "rendered: docker.io/library/busybox:1.38.0" "$d"
+grafana_sa="monitoring-kube-prometheus-stack-grafana"
+# grafana_rbac <dir>: the approved custom ConfigMap-only Role and RoleBinding, listed in
+# controllers/kustomization.yaml as the Phase 3 implementation must do.
+grafana_rbac() {
+  printf '  - grafana-rbac.yaml\n' >> "$1/controllers/kustomization.yaml"
+  cat > "$1/controllers/grafana-rbac.yaml" <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-configmap-reader
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-configmap-reader
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: grafana-configmap-reader
+subjects:
+  - kind: ServiceAccount
+    name: ${grafana_sa}
+    namespace: monitoring
+EOF
+}
+# grafana_dir <name> [extra python for the HelmRelease]: approved Grafana plus custom RBAC.
+grafana_dir() {
+  local d
+  d="$(new_dir "$1")"
+  edit_yaml "$(hr "$d")" "${GRAFANA_APPROVED}${2:+
+$2}"
+  grafana_rbac "$d"
+  echo "$d"
+}
 
-d="$(new_dir grafana-test-framework)"
-edit_yaml "$(hr "$d")" "$GRAFANA_PHASE3"'
-doc["spec"]["values"]["grafana"]["testFramework"] = {"enabled": True,
-    "image": {"registry": "docker.io", "repository": "bats/bats", "tag": "1.14.0"}}'
+# --- Pod Security and Grafana RBAC: positive ----------------------------------------
+d="$(new_dir repo-mode-pod-security)"
+case_run "Pod Security: privileged node-exporter namespace is not checked" pass \
+  "namespace enforces privileged; not checked" "$d"
+case_run "Pod Security: restricted workloads in monitoring pass" pass \
+  "pod security (targeted): Deployment monitoring/monitoring-kube-prometheus-operator: restricted checks passed" "$d"
+case_run "Pod Security: output states the checks are targeted, not complete" pass \
+  "not a complete Pod Security Standards evaluation (live admission and the k3d rehearsal are authoritative)" "$d"
+case_run "Grafana RBAC: Grafana disabled" pass \
+  "Grafana is not rendered; checking only that no Grafana cluster-wide RBAC exists" "$d"
+
+d="$(grafana_dir grafana-approved)"
+case_run "approved Grafana: restricted checks pass without initChownData" pass \
+  "pod security (targeted): Deployment monitoring/${grafana_sa}: restricted checks passed" "$d"
+case_run "approved Grafana: custom ConfigMap-only Role bound to the Grafana ServiceAccount" pass \
+  "RoleBinding monitoring/grafana-configmap-reader -> Role grafana-configmap-reader" "$d"
+case_run "approved Grafana: dashboard sidecar confined to monitoring ConfigMaps" pass \
+  "Grafana sidecar grafana-sc-dashboard: namespace=['monitoring'] resource=configmap" "$d"
+case_run "approved Grafana: datasource sidecar confined to monitoring ConfigMaps" pass \
+  "Grafana sidecar grafana-sc-datasources: namespace=['monitoring'] resource=configmap" "$d"
+
+d="$(grafana_dir grafana-test-framework 'doc["spec"]["values"]["grafana"]["testFramework"] = {"enabled": True,
+    "image": {"registry": "docker.io", "repository": "bats/bats", "tag": "1.14.0"}}')"
 case_run "Grafana test framework enabled (no approved image)" fail \
   "image pin: grafana.testFramework.image: docker.io/bats/bats:1.14.0 is not approved in the design Versions table row" "$d"
+
+# --- Pod Security: negative ---------------------------------------------------------
+d="$(grafana_dir grafana-init-chown 'doc["spec"]["values"]["grafana"]["initChownData"] = {"enabled": True,
+    "image": {"registry": "docker.io", "repository": "library/busybox", "tag": "1.38.0"}}')"
+case_run "root-running Grafana initChownData rejected by restricted Pod Security" fail \
+  "Pod Security targeted check (restricted): Deployment monitoring/${grafana_sa}: initContainer init-chown-data: runAsNonRoot must be true" "$d"
+case_run "root-running initChownData still renders its approved busybox pin before rejection" fail \
+  "rendered: docker.io/library/busybox:1.38.0" "$d"
+
+d="$(new_dir node-exporter-restricted)"
+edit_yaml "$(hr "$d")" 'del doc["spec"]["values"]["prometheus-node-exporter"]["namespaceOverride"]'
+case_run "node-exporter in the restricted monitoring namespace" fail \
+  "Pod Security targeted check (restricted): DaemonSet monitoring/monitoring-kube-prometheus-stack-prometheus-node-exporter: hostNetwork must not be true" "$d"
+
+d="$(new_dir namespace-undeclared)"
+rm "$d/controllers/namespace.yaml"
+case_run "undeclared namespace is checked as restricted (fail closed)" fail \
+  "(namespace level not declared; checked as restricted)" "$d"
+
+d="$(new_dir container-escalation)"
+edit_yaml "$(hr "$d")" 'doc["spec"]["values"]["kube-state-metrics"]["containerSecurityContext"] = {"allowPrivilegeEscalation": True}'
+case_run "rendered container allowing privilege escalation" fail \
+  "container kube-state-metrics: allowPrivilegeEscalation must be false" "$d"
+
+d="$(new_dir prometheus-root)"
+edit_yaml "$(hr "$d")" 'doc["spec"]["values"]["prometheus"]["prometheusSpec"]["securityContext"] = {"runAsNonRoot": False, "runAsUser": 0}'
+case_run "Prometheus pod-level securityContext running as root" fail \
+  "Pod Security targeted check (restricted): Prometheus monitoring/monitoring-kube-prometheus-prometheus: pod runAsUser must not be 0" "$d"
+
+d="$(new_dir committed-privileged-pod)"
+printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: ci-privileged\n  namespace: monitoring\nspec:\n  containers:\n    - name: shell\n      image: docker.io/library/busybox:1.38.0\n      securityContext:\n        privileged: true\n' \
+  > "$d/configs/pod.yaml"
+case_run "committed privileged workload in the monitoring directory" fail \
+  "Pod Security targeted check (restricted): Pod monitoring/ci-privileged: container shell: privileged must not be true" "$d"
+
+# A Pod that passes every other targeted restricted check, so only the host field fails.
+compliant_pod() {  # compliant_pod <name> <extra container YAML, indented 4 spaces>
+  printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: %s\n  namespace: monitoring\nspec:\n  securityContext:\n    runAsNonRoot: true\n    runAsUser: 65534\n    seccompProfile:\n      type: RuntimeDefault\n  containers:\n  - name: app\n    image: docker.io/library/busybox:1.38.0\n    securityContext:\n      allowPrivilegeEscalation: false\n      capabilities:\n        drop: [ALL]\n%s\n' "$1" "$2"
+}
+d="$(new_dir probe-host)"
+compliant_pod ci-probe-host '    livenessProbe:
+      httpGet:
+        host: 10.0.0.1
+        port: 8080' > "$d/configs/pod.yaml"
+case_run "probe handler setting host (baseline control, v1.34+)" fail \
+  "Pod Security targeted check (restricted): Pod monitoring/ci-probe-host: container app: livenessProbe.httpGet.host must not be set" "$d"
+
+d="$(new_dir lifecycle-host)"
+compliant_pod ci-lifecycle-host '    lifecycle:
+      preStop:
+        tcpSocket:
+          host: 10.0.0.1
+          port: 8080' > "$d/configs/pod.yaml"
+case_run "lifecycle handler setting host (baseline control, v1.34+)" fail \
+  "Pod Security targeted check (restricted): Pod monitoring/ci-lifecycle-host: container app: lifecycle.preStop.tcpSocket.host must not be set" "$d"
+
+d="$(new_dir compliant-committed-pod)"
+compliant_pod ci-compliant '    readinessProbe:
+      httpGet:
+        port: 8080' > "$d/configs/pod.yaml"
+case_run "committed workload meeting the targeted restricted checks" pass \
+  "pod security (targeted): Pod monitoring/ci-compliant: restricted checks passed" "$d"
+
+# --- Grafana RBAC: negative ---------------------------------------------------------
+d="$(grafana_dir grafana-chart-clusterrole 'doc["spec"]["values"]["grafana"]["rbac"] = {"create": True}')"
+case_run "Grafana chart RBAC creates a ClusterRole" fail \
+  "Grafana RBAC: ClusterRole ${grafana_sa}-clusterrole: Grafana must not have cluster-wide RBAC" "$d"
+
+d="$(grafana_dir grafana-chart-role-secrets 'doc["spec"]["values"]["grafana"]["rbac"] = {"create": True, "namespaced": True}')"
+case_run "Grafana chart namespaced Role grants Secret access" fail \
+  "Role monitoring/${grafana_sa} rule 0: Grafana must not be granted access to Secrets" "$d"
+
+d="$(grafana_dir grafana-custom-role-secrets)"
+edit_docs "$d/controllers/grafana-rbac.yaml" 'docs[0]["rules"][0]["resources"].append("secrets")'
+case_run "custom Grafana Role grants Secret access" fail \
+  "Role monitoring/grafana-configmap-reader rule 0: Grafana must not be granted access to Secrets" "$d"
+
+d="$(grafana_dir grafana-custom-role-verbs)"
+edit_docs "$d/controllers/grafana-rbac.yaml" 'docs[0]["rules"][0]["verbs"].append("update")'
+case_run "custom Grafana Role grants a write verb" fail \
+  "only get, list and watch are allowed, found verbs=['get', 'list', 'update', 'watch']" "$d"
+
+d="$(grafana_dir grafana-binding-clusterrole)"
+edit_docs "$d/controllers/grafana-rbac.yaml" 'docs[1]["roleRef"] = {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "view"}'
+case_run "Grafana RoleBinding referencing a ClusterRole" fail \
+  "must reference a namespaced Role, not ClusterRole view" "$d"
+
+d="$(grafana_dir grafana-clusterrolebinding)"
+edit_docs "$d/controllers/grafana-rbac.yaml" 'docs.append({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
+    "metadata": {"name": "ci-grafana-view"}, "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "view"},
+    "subjects": [{"kind": "ServiceAccount", "name": "monitoring-kube-prometheus-stack-grafana", "namespace": "monitoring"}]})'
+case_run "ClusterRoleBinding granting the Grafana ServiceAccount cluster-wide access" fail \
+  "ClusterRoleBinding ci-grafana-view: binds the Grafana ServiceAccount cluster-wide" "$d"
+
+d="$(grafana_dir grafana-rbac-other-namespace)"
+edit_docs "$d/controllers/grafana-rbac.yaml" 'docs[0]["metadata"]["namespace"] = "default"
+docs[1]["metadata"]["namespace"] = "default"'
+case_run "Grafana access granted outside the monitoring namespace" fail \
+  "Grafana may be granted access only in namespace monitoring" "$d"
+
+d="$(grafana_dir grafana-no-role)"
+rm "$d/controllers/grafana-rbac.yaml"
+sed -i '/grafana-rbac.yaml/d' "$d/controllers/kustomization.yaml"
+case_run "Grafana sidecars without the ConfigMap Role" fail \
+  "no Role bound to the Grafana ServiceAccount grants them" "$d"
+
+d="$(grafana_dir grafana-rbac-orphan)"
+sed -i '/grafana-rbac.yaml/d' "$d/controllers/kustomization.yaml"
+case_run "approved RBAC file present but omitted from the controllers kustomization" fail \
+  "Role monitoring/grafana-configmap-reader in ${d}/controllers/grafana-rbac.yaml is not part of the monitoring/controllers Kustomization render; add its file to controllers/kustomization.yaml" "$d"
+case_run "orphaned RBAC grants the sidecars nothing" fail \
+  "no Role bound to the Grafana ServiceAccount grants them" "$d"
+
+d="$(new_dir controllers-kustomization-broken)"
+printf '  - missing.yaml\n' >> "$d/controllers/kustomization.yaml"
+case_run "controllers Kustomization that cannot be rendered" fail \
+  "kustomize build failed for ${d}/controllers" "$d"
+
+d="$(grafana_dir grafana-sidecar-all-namespaces 'doc["spec"]["values"]["grafana"]["sidecar"]["dashboards"]["searchNamespace"] = "ALL"')"
+case_run "Grafana dashboard sidecar watching all namespaces" fail \
+  "Grafana sidecar grafana-sc-dashboard: watches namespaces ['ALL']; only monitoring is allowed" "$d"
+
+d="$(grafana_dir grafana-sidecar-other-namespace 'doc["spec"]["values"]["grafana"]["sidecar"]["dashboards"]["searchNamespace"] = ["monitoring", "flux-system"]')"
+case_run "Grafana dashboard sidecar watching another namespace" fail \
+  "watches namespaces ['monitoring', 'flux-system']; only monitoring is allowed" "$d"
+
+d="$(grafana_dir grafana-sidecar-secrets 'doc["spec"]["values"]["grafana"]["sidecar"]["datasources"]["resource"] = "both"')"
+case_run "Grafana datasource sidecar reading Secrets" fail \
+  "Grafana sidecar grafana-sc-datasources: RESOURCE=both; only configmap is allowed" "$d"
 
 # --- negative: HelmRelease structure and rendering parity -------------------------
 d="$(new_dir values-not-mapping)"

@@ -19,15 +19,25 @@
 #   - kubeconform validates the rendered resources (CRDs are counted, not schema-checked);
 #   - the rendered chart contains the approved full reference of every enabled pin, and
 #     independently, every rendered container image has an explicit, non-latest tag or a digest;
+#   - targeted static Pod Security checks: every rendered or committed workload is checked
+#     against the controls relevant to these monitoring workloads, at the level enforced on
+#     its namespace by the committed Namespace manifests (an undeclared or unlabelled
+#     namespace is checked as restricted). This is NOT a complete Pod Security Standards
+#     evaluation (no AppArmor, SELinux or Windows details; Prometheus/Alertmanager pod-level
+#     fields only); live admission and the k3d rehearsal remain authoritative;
+#   - Grafana has no cluster-wide RBAC and no Secret access, may read only ConfigMaps in the
+#     release namespace through a namespaced Role, and its sidecars watch only that namespace.
+#     Custom RBAC counts only if it is in the `kustomize build` output of the
+#     controllers Kustomization; an RBAC file that Flux would not apply is rejected;
 #   - promtool checks repository PrometheusRules with fatal duplicate-rule lint, and
 #     chart-rendered rules for syntax, accepting only exact known chart lint findings;
 #   - every dashboard JSON file parses;
 #   - no Secret manifest is committed under the monitoring directory.
 #
 # Static only: this does not show scheduling, storage binding, scrape success,
-# webhook behaviour, or rule behaviour on a cluster.
+# webhook behaviour, rule behaviour, or Pod Security admission on a cluster.
 #
-# Requires: helm, kubeconform, promtool, python3 with PyYAML, sha256sum, curl
+# Requires: helm, kustomize, kubeconform, promtool, python3 with PyYAML, sha256sum, curl
 set -euo pipefail
 
 # Chart pin. Selected for validation on 2026-09-30. The SHA-256 is the
@@ -144,6 +154,19 @@ echo "::endgroup::"
 echo "::group::Image references (rendered)"
 python3 "$checks" image-refs "${work}/rendered.yaml" "${work}/values.yaml" "$IMAGE_PINS"
 python3 "$checks" images "${work}/rendered.yaml"
+echo "::endgroup::"
+
+echo "::group::Pod Security (targeted static checks; not a complete Pod Security Standards evaluation)"
+python3 "$checks" pod-security "$hr_namespace" "${work}/rendered.yaml" "${manifests[@]}"
+echo "::endgroup::"
+
+echo "::group::Grafana RBAC scope (rendered chart and the applied controllers Kustomization)"
+# Custom RBAC counts only if Flux applies it: render the controllers Kustomization.
+if ! kustomize build "$controllers" > "${work}/controllers-applied.yaml"; then
+  echo "::error::kustomize build failed for ${controllers}; the applied monitoring/controllers objects cannot be determined"
+  exit 1
+fi
+python3 "$checks" grafana-rbac "$hr_namespace" "${work}/rendered.yaml" "${work}/controllers-applied.yaml" "${manifests[@]}"
 echo "::endgroup::"
 
 echo "::group::PrometheusRules (promtool)"
