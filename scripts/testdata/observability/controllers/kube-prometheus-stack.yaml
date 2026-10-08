@@ -56,6 +56,8 @@ spec:
         repository: kube-state-metrics/kube-state-metrics
         tag: v2.20.0
     prometheus-node-exporter:
+      # As in the real HelmRelease: node-exporter needs host namespaces and hostPath.
+      namespaceOverride: monitoring-node-exporter
       image:
         registry: quay.io
         repository: prometheus/node-exporter
