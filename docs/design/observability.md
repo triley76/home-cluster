@@ -172,7 +172,7 @@ Observability Phase 1 (CI) selected chart `91.8.2` for validation on 2026-09-30.
 | Alertmanager | `quay.io/prometheus/alertmanager:v0.34.1` |
 | Grafana (subchart `13.2.7`) | `docker.io/grafana/grafana:13.2.3-distroless` |
 | Grafana sidecar | `quay.io/kiwigrid/k8s-sidecar:2.11.2` |
-| Grafana init (chown) | `docker.io/library/busybox:1.38.0` (Grafana `initChownData`, kept for the `local-path` claim; see rehearsal item 8) |
+| Grafana init (chown) | `docker.io/library/busybox:1.38.0` — **not deployed since Phase 3** (`grafana.initChownData.enabled: false`). Its root init container is incompatible with the `restricted` Pod Security level, which CI enforces. The reference stays listed so that re-enabling it fails CI on Pod Security, not on an unapproved image. |
 | Grafana test framework | Not deployed: `grafana.testFramework.enabled: false` (no image approved) |
 | kube-state-metrics (subchart `8.6.0`) | `registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0` |
 | node-exporter (subchart `4.59.0`) | `quay.io/prometheus/node-exporter:v1.12.1-distroless` (chart default distroless variant) |
@@ -194,7 +194,7 @@ Summary of the `HelmRelease` values. The exact values file is produced in the im
 | Selectors | `podMonitorSelectorNilUsesHelmValues`, `serviceMonitorSelectorNilUsesHelmValues`, `ruleSelectorNilUsesHelmValues` set to `false`, so objects in `monitoring-configs` are selected without the Helm release label |
 | Prometheus | 1 replica, `retention: 7d`, `retentionSize: 8GB`, `walCompression: true`, `volumeClaimTemplate` on `local-path` requesting 10 GiB, default 30 s scrape and evaluation intervals |
 | Alertmanager | 1 replica, `emptyDir` storage, default configuration with the `null` receiver |
-| Grafana | 1 replica, persistence on `local-path` 1 GiB, `admin.existingSecret` referencing an out-of-band Secret, no plugins, anonymous access disabled, dashboard sidecar enabled, `initChownData` kept, `testFramework.enabled: false` (Helm test Pods are not used; CI and the rehearsal provide validation) |
+| Grafana | 1 replica, persistence on `local-path` 1 GiB, `admin.existingSecret` referencing an out-of-band Secret, `deploymentStrategy: Recreate` (one SQLite database on a single-node claim), no additional (non-core) plugins configured and background/preinstalled plugin installation disabled (built-in core plugins remain), anonymous access and sign-up disabled, analytics reporting and update checks disabled, chart dashboards and the Grafana `ServiceMonitor` kept, `initChownData` **disabled** (restricted Pod Security; see [Pod Security](#pod-security-and-node-exporter)), `testFramework.enabled: false` (Helm test Pods are not used; CI and the rehearsal provide validation). Chart RBAC disabled (`rbac.create: false`); see [Security](#security-and-credential-handling) |
 | Services | Grafana, Prometheus and Alertmanager all `ClusterIP`. No `LoadBalancer` Service and no MetalLB address in this design |
 | kube-state-metrics | 1 replica. Custom Resource State configuration exporting Flux resources as `gotk_resource_info`, as recommended by the Flux monitoring documentation, with RBAC `extraRules` for the Flux CRDs |
 | node-exporter | DaemonSet on all three nodes; chart defaults `hostNetwork`, `hostPID`, and a read-only root filesystem mount. Namespace placement per [Pod Security](#pod-security-and-node-exporter) |
@@ -239,7 +239,7 @@ This has not been observed. The k3d rehearsal must show MetalLB targets `up`, wi
 | Prometheus config-reloader | 1 | 10m / 50m | 32 MiB / 64 MiB |
 | Prometheus Operator | 1 | 50m / 200m | 64 MiB / 256 MiB |
 | Alertmanager (+ reloader) | 1 | 35m / 150m | 96 MiB / 192 MiB |
-| Grafana (+ sidecar) | 1 | 70m / 300m | 192 MiB / 640 MiB |
+| Grafana (+ 2 sidecars) | 1 | 70m / 300m (Grafana 50m / 200m; each sidecar 10m / 50m) | 192 MiB / 640 MiB (Grafana 128 / 512; each sidecar 32 / 64) |
 | kube-state-metrics | 1 | 25m / 100m | 64 MiB / 256 MiB |
 | node-exporter | 3 | 25m / 100m each | 32 MiB / 64 MiB each |
 | **Total** | | **≈ 465m / ≈ 2.1 CPU** | **≈ 1.5 GiB / ≈ 3.6 GiB** |
@@ -296,7 +296,7 @@ These limitations are accepted for this design and must stay visible in document
 - **PVC expansion is disabled.** Growing Prometheus storage means a new claim, and the previous data is lost unless it is copied manually.
 - **`reclaimPolicy: Delete`.** Deleting a claim deletes its data.
 - **Claims can outlive the release.** Prometheus's claim is created by a StatefulSet `volumeClaimTemplate`, so it is not removed when the HelmRelease is uninstalled. It must be deleted manually, which then deletes its data.
-- **Grafana's claim lifecycle is not assumed.** It is created differently from Prometheus's, and it may or may not be deleted with the release. The implementation inspects the rendered chart and tests it in the rehearsal (see [Rollback](#rollback)).
+- **Grafana's claim is deleted with Grafana (accepted).** The chart renders it as an ordinary release object without `helm.sh/resource-policy: keep`, and none is added. Disabling Grafana is therefore expected to delete the claim, and with `reclaimPolicy: Delete` its volume. That loses Grafana users, preferences and database state; Git-managed dashboards remain. Whether the out-of-band admin Secret remains depends on the operation (see [Rollback](#rollback)): it survives the Phase 3 rollback, which keeps the `monitoring` namespace, but is deleted by a full monitoring-layer removal, which prunes the namespace. The k3d rehearsal observes and records both.
 - **This is not HA monitoring.** Monitoring is least available exactly when a node fails.
 
 ## Security and credential handling
@@ -304,15 +304,18 @@ These limitations are accepted for this design and must stay visible in document
 - **Nothing secret in Git.** No passwords, tokens, API keys, webhook URLs, or generated secrets are committed.
 - **Grafana admin credentials:** a Secret `monitoring/grafana-admin`, with keys `admin-user` and `admin-password`, is created out of band before Grafana is enabled. The password is generated on the operator's workstation and stored in the owner's password manager. The `HelmRelease` references it with `admin.existingSecret`.
   - The Secret is not in any Flux inventory, so Flux will neither create nor prune it. Deleting the `monitoring` namespace would delete it.
+  - The username is `admin`; the password is random, at least 32 characters, and never requested, printed, captured or committed.
+  - Grafana applies the admin password from the Secret only when it creates its database. Changing the Secret afterwards does not change the password of an existing database.
   - Migrating it to an encrypted or external secret workflow is part of the pending secret-management work in [SECURITY.md](../../SECURITY.md).
 - **Chart-generated secrets** (for example, Alertmanager configuration, the admission-webhook certificates and the Prometheus ServiceAccount token Secret described below) are created in the cluster and never exported to Git.
 - **Exposure:** none on the LAN.
   - Grafana, Prometheus and Alertmanager are `ClusterIP`, reached with `kubectl port-forward` by someone who already holds cluster credentials.
   - Grafana still requires its admin login.
-  - Anonymous access, sign-up, and plugin installation are disabled.
+  - Anonymous access and sign-up are disabled. No additional (non-core) plugins are configured, and background/preinstalled plugin installation is disabled; Grafana's built-in core plugins remain.
 - **RBAC:**
   - Prometheus receives the chart's standard cluster-wide read access for discovery.
   - kube-state-metrics receives read access to the Flux custom resources it reports on.
+  - Grafana receives no chart RBAC (`grafana.rbac.create: false`; the chart's default would read ConfigMaps and Secrets in every namespace). `monitoring/controllers/grafana-rbac.yaml` binds a namespaced Role to the Grafana ServiceAccount granting only `get`, `list` and `watch` on ConfigMaps in `monitoring`. Both sidecars watch only `monitoring` and only ConfigMaps. CI rejects any Grafana ClusterRole or ClusterRoleBinding, Secret access, other namespaces, or RBAC that the controllers Kustomization does not apply.
   - No write access to cluster resources is added.
 
 ### Prometheus ServiceAccount token Secret (accepted Phase 2 risk)
@@ -348,6 +351,8 @@ The candidate chart exposes `prometheus-node-exporter.namespaceOverride`. Whethe
 - `monitoring` is labelled `enforce: privileged`, with `audit` and `warn` at `restricted`, so any other pod that would violate `restricted` is still reported;
 - this is documented as an **accepted lab risk**;
 - it requires explicit approval, recorded in the implementation PR, before merge.
+
+**Grafana (Phase 3)** runs in `monitoring` under `restricted`. For that reason the chart's `initChownData` init container, which runs as root with `CHOWN` and `DAC_OVERRIDE`, is disabled, and `monitoring` is not relaxed.
 
 In either case, `platform-demo` stays `restricted`.
 
@@ -405,7 +410,7 @@ Each is confirmed against the chosen versions in the k3d rehearsal, and adjusted
 | 0 | None: live preflight and baseline; version re-verification and release-note review | None |
 | 1 | CI only: render the `HelmRelease` values with the chosen chart (`helm template`) and schema-validate the output; check PrometheusRule syntax with `promtool`; validate that dashboard files parse as JSON | None |
 | 2 | `monitoring.yaml` (both Kustomizations), `monitoring/controllers/` with the Namespace(s), HelmRepository and HelmRelease, with **Grafana disabled**; an empty `monitoring/configs/`; root kustomization adds `monitoring.yaml`. The Pod Security approach from the node-exporter investigation is included, or the accepted-risk approval is recorded. | Installs Prometheus Operator (with admission webhooks), Prometheus, Alertmanager, kube-state-metrics, node-exporter |
-| 3 | Out of band first: create `monitoring/grafana-admin`. Then the PR enables Grafana, with persistence and a `ClusterIP` Service. | Adds Grafana; no LAN exposure |
+| 3 | Out of band first: create `monitoring/grafana-admin`. Then the PR enables Grafana, with persistence and a `ClusterIP` Service, and adds its ConfigMap-only Role and RoleBinding (`grafana-rbac.yaml`). | Adds Grafana; no LAN exposure |
 | 4 | `monitoring/configs/`: PodMonitors for Flux and MetalLB (MetalLB only if the rehearsal assertion held), platform PrometheusRules limited to verified metrics, dashboards; kube-state-metrics Flux custom-resource configuration in the HelmRelease values | Adds scrape targets, rules, dashboards; Helm upgrade of the monitoring release only |
 | 5 | Documentation: validation record with observed evidence and boundaries | None |
 | Later, separate designs | Grafana exposure through MetalLB (tentatively `10.0.0.221`) with authentication and TLS; notification receiver, once a destination and secret-management workflow are approved; a possible Alertmanager claim at the same time | – |
@@ -443,7 +448,7 @@ It must show:
 5. **Flux assertion:** `gotk_resource_info` reports every Flux Kustomization, GitRepository, and HelmRelease, with the expected label values.
 6. **Metric-name assertion:** every platform rule expression returns data, or is removed. All PrometheusRules load without errors, and deleting a canary pod raises the expected alert state.
 7. **node-exporter isolation:** the checks listed under [Pod Security](#pod-security-and-node-exporter), with the outcome recorded either way.
-8. Grafana answers through `kubectl port-forward` and loads the provisioned dashboards. No `LoadBalancer` Service exists in the `monitoring` namespaces. The Grafana claim's behavior when Grafana is disabled, and when the release is uninstalled, is recorded (see [Rollback](#rollback)). The rehearsal also records whether the fresh `local-path` claim actually needs the `initChownData` permissions initializer (initial ownership of the claim directory, and whether Grafana starts with the initializer disabled). The initializer is removed later only with evidence that Grafana starts successfully on a fresh claim without it.
+8. Grafana answers through `kubectl port-forward` and loads the provisioned dashboards. No `LoadBalancer` Service exists in the `monitoring` namespaces. The Grafana claim's behavior is recorded for the Phase 3 rollback (Grafana disabled; the out-of-band Secret must survive) and for a full monitoring-layer removal (namespaces pruned; the Secret is deleted with them) (see [Rollback](#rollback)). Phase 3 disables the `initChownData` permissions initializer, because its root init container is incompatible with `restricted`. The rehearsal must prove that Grafana starts under `restricted` and writes to a freshly provisioned `local-path` claim without it, and records the claim directory's initial ownership and mode. It also proves that the ConfigMap-only RBAC is sufficient for both sidecars, that no Secret or cluster-wide access is granted, and that the admin login works with a throwaway Secret that is never printed or archived.
 9. **Independence:** run two cases, `monitoring` suspended, and separately `monitoring` deliberately failing (for example, an invalid chart version on a test branch). In both cases, the rehearsal must show that `apps` and `infrastructure-*`:
    - reconcile a new revision independently;
    - remain `Ready`;
@@ -482,17 +487,22 @@ Suspending `monitoring` stops reconciliation, but it does not stop running pods.
 
 ### Rollback
 
-- **Revert the phase's PR.** With normal garbage collection, Flux prunes the removed objects, and pruning the `HelmRelease` uninstalls the release.
-- **Manual cleanup after uninstalling:**
+- **Revert the phase's PR.** With normal garbage collection, Flux prunes only the objects that PR added, and a values change in the `HelmRelease` is reverted by a Helm upgrade. What a revert removes therefore depends on the phase.
+- **Phase 3 rollback (the normal rollback for this phase):** reverting the Phase 3 PR reverts only the Grafana-enabling changes. The `HelmRelease` was introduced in Phase 2 and stays: Flux applies its reverted values, and the resulting Helm upgrade disables Grafana. Flux prunes only Phase 3-specific objects, such as the Role and RoleBinding from `grafana-rbac.yaml`. The `HelmRelease` is **not** pruned or uninstalled. Grafana's claim is deleted as observed in the rehearsal (losing Grafana users, preferences and database state), and the out-of-band `grafana-admin` Secret remains.
+- **Full monitoring-layer removal is a broader, destructive uninstall, not the normal Phase 3 rollback** (it is what reverting Phase 2 does): removing `monitoring.yaml` from the root prunes both monitoring Kustomizations, uninstalls the release, and prunes the `monitoring` and `monitoring-node-exporter` namespaces. Kubernetes deletes everything in those namespaces, **including the out-of-band `grafana-admin` Secret**; it must be recreated out of band before Grafana is enabled again.
+- **Manual cleanup after a full removal:**
   - The Prometheus claim from the StatefulSet `volumeClaimTemplate` remains, and must be deleted manually. That deletes its data.
-  - **Grafana's claim is not assumed to behave like Prometheus's.** The implementation inspects the rendered manifests of the chosen chart (the claim template and any `helm.sh/resource-policy` annotation). The k3d rehearsal records two cases:
-    1. Grafana is disabled in the values (a Helm upgrade).
-    2. The release is uninstalled.
+  - **Grafana's claim is not assumed to behave like Prometheus's.** The rendered chart 91.8.2 creates it as an ordinary release object without `helm.sh/resource-policy: keep`, so deletion is expected; Phase 3 accepts that and adds no `keep` policy. The k3d rehearsal observes and records two distinct cases:
+    1. Phase 3 rollback: Grafana is disabled in the values (a Helm upgrade); the `monitoring` namespace stays and `grafana-admin` must survive.
+    2. Full monitoring-layer removal: `monitoring.yaml` is removed and both namespaces are pruned; `grafana-admin` is deleted with the namespace.
 
-    In each case it records whether the Grafana claim is retained or deleted, and the resulting data-loss behavior. Deletion loses Grafana users, preferences and database state; provisioned dashboards return from Git. That observed behavior is written into the implementation PR and the validation record before Phase 3 merges.
+    In each case it records whether the Grafana claim and volume are retained or deleted, and the resulting data-loss behavior. Deletion loses Grafana users, preferences and database state; provisioned dashboards return from Git. That observed behavior is written into the implementation PR and the validation record before Phase 3 merges.
   - The Prometheus Operator CRDs remain after uninstall. Deleting them deletes every object of those kinds, and is a separate, deliberate step.
-  - The out-of-band `grafana-admin` Secret remains until it is deleted, or the namespace is removed.
-- **Scope of a rollback:** it removes monitoring only. It does not touch `infrastructure-*`, `apps`, or MetalLB.
+  - The out-of-band `grafana-admin` Secret remains until it is deleted or the `monitoring` namespace is removed (as a full monitoring-layer removal does).
+- **Scope of a rollback:**
+  - The normal Phase 3 rollback disables and removes Grafana only. The monitoring layer, the `HelmRelease`, Prometheus, Alertmanager, kube-state-metrics, node-exporter, both monitoring Kustomizations and both monitoring namespaces stay in place.
+  - A full monitoring-layer removal removes the whole monitoring stack; it is a separate, destructive operation, not the normal Phase 3 rollback.
+  - Neither touches `infrastructure-*`, `apps`, or MetalLB.
 
 ### Post-merge validation (each phase)
 
