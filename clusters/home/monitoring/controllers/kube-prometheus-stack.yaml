@@ -163,8 +163,9 @@ spec:
       serviceMonitor:
         enabled: true
       defaultDashboardsEnabled: true
+      # 256Mi request: above the 232Mi peak measured in k3d-obs-p3-clean-20261008T234804Z.
       resources:
-        requests: {cpu: 50m, memory: 128Mi}
+        requests: {cpu: 50m, memory: 256Mi}
         limits: {cpu: 200m, memory: 512Mi}
       # The chart's RBAC would read Secrets cluster-wide; grafana-rbac.yaml grants only
       # get/list/watch on ConfigMaps in monitoring.
@@ -176,9 +177,10 @@ spec:
           repository: kiwigrid/k8s-sidecar
           tag: 2.11.2
         # Applies to both sidecars. 64Mi limits were OOM-killed in the k3d rehearsal
-        # (k3d-obs-p3-clean-20261008T172438Z); 256Mi pending observed usage.
+        # (k3d-obs-p3-clean-20261008T172438Z); peaks of 74Mi and 94Mi were measured in
+        # k3d-obs-p3-clean-20261008T234804Z, so requests are 128Mi under 256Mi limits.
         resources:
-          requests: {cpu: 10m, memory: 64Mi}
+          requests: {cpu: 10m, memory: 128Mi}
           limits: {cpu: 50m, memory: 256Mi}
         dashboards:
           resource: configmap

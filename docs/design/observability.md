@@ -239,20 +239,26 @@ This has not been observed. The k3d rehearsal must show MetalLB targets `up`, wi
 | Prometheus config-reloader | 1 | 10m / 50m | 32 MiB / 64 MiB |
 | Prometheus Operator | 1 | 50m / 200m | 64 MiB / 256 MiB |
 | Alertmanager (+ reloader) | 1 | 35m / 150m | 96 MiB / 192 MiB |
-| Grafana (+ 2 sidecars) | 1 | 70m / 300m (Grafana 50m / 200m; each sidecar 10m / 50m) | 256 MiB / 1 GiB (Grafana 128 / 512; each sidecar 64 / 256) |
+| Grafana (+ 2 sidecars) | 1 | 70m / 300m (Grafana 50m / 200m; each sidecar 10m / 50m) | 512 MiB / 1 GiB (Grafana 256 / 512; each sidecar 128 / 256) |
 | kube-state-metrics | 1 | 25m / 100m | 64 MiB / 256 MiB |
 | node-exporter | 3 | 25m / 100m each | 32 MiB / 64 MiB each |
-| **Total** | | **≈ 465m / ≈ 2.1 CPU** | **≈ 1.6 GiB / ≈ 3.9 GiB** |
+| **Total** | | **≈ 465m / ≈ 2.1 CPU** | **≈ 1.8 GiB / ≈ 3.9 GiB** |
 
 The admission-webhook certificate Jobs are short-lived and not included.
 
-The Grafana sidecar memory was raised from 32/64 MiB to 64/256 MiB after the first Phase 3 k3d rehearsal (`k3d-obs-p3-clean-20261008T172438Z`) showed both sidecars `OOMKilled` at a 64 MiB limit, so no dashboards or datasources were provisioned. 256 MiB is provisional: the next rehearsal records per-container memory, and the limit is resized from observed usage.
+Grafana and sidecar memory was sized from k3d rehearsal evidence:
+
+- The first Phase 3 rehearsal (`k3d-obs-p3-clean-20261008T172438Z`) showed both sidecars `OOMKilled` at a 64 MiB limit, so no dashboards or datasources were provisioned. The limits were raised to 256 MiB.
+- The passing rehearsal (`k3d-obs-p3-clean-20261008T234804Z`) measured peak working sets, including dashboard and datasource provisioning, of 74 MiB (dashboard sidecar) and 94 MiB (datasource sidecar) of 256 MiB, and 232 MiB of 512 MiB for Grafana, with no restarts or OOM kills.
+- Each sidecar therefore requests 128 MiB: above both measured peaks with headroom, so neither sidecar normally runs above its request. Limits stay at 256 MiB.
+- Grafana itself used 227–229 MiB with a 232 MiB peak, about 100 MiB above its former 128 MiB request. Its request is therefore 256 MiB, above the measured peak with modest headroom; its limit stays at 512 MiB.
+- These are k3d measurements on one node with chart-default dashboards only; live usage is checked after deployment (see below).
 
 As a share of the cluster's 12 CPUs and about 23.3 GiB of memory:
 
 | Measure | CPU | Memory |
 | --- | --- | --- |
-| Requests | about 4% | about 7% |
+| Requests | about 4% | about 8% |
 | Limits | about 18% | about 17% |
 
 Current use is 15–19% memory per node. The node hosting Prometheus is expected to rise by about 1–2 GiB.
