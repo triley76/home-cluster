@@ -1,6 +1,6 @@
-# kube-prometheus-stack, observability Phase 2 (docs/design/observability.md).
-# Grafana is disabled until Phase 3. Every enabled image is pinned explicitly; CI
-# checks each pin against scripts/observability-image-pins.yaml and the design.
+# kube-prometheus-stack, observability Phases 2 and 3 (docs/design/observability.md).
+# Grafana is enabled in Phase 3. Every enabled image is pinned explicitly; CI checks
+# each pin against scripts/observability-image-pins.yaml and the design.
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
@@ -131,7 +131,71 @@ spec:
         requests: {cpu: 25m, memory: 32Mi}
         limits: {cpu: 100m, memory: 64Mi}
 
+    # Observability Phase 3 (docs/design/observability.md). ClusterIP only, reached with
+    # kubectl port-forward; no LoadBalancer, ingress or NodePort.
     grafana:
-      enabled: false
+      enabled: true
+      image:
+        registry: docker.io
+        repository: grafana/grafana
+        tag: 13.2.3-distroless
       testFramework:
         enabled: false
+      # Out-of-band Secret, never committed (keys admin-user and admin-password).
+      admin:
+        existingSecret: grafana-admin
+        userKey: admin-user
+        passwordKey: admin-password
+      persistence:
+        enabled: true
+        storageClassName: local-path
+        accessModes: ["ReadWriteOnce"]
+        size: 1Gi
+      # The chart's root chown init container is incompatible with restricted Pod
+      # Security; the k3d rehearsal proves Grafana writes to a fresh local-path claim.
+      initChownData:
+        enabled: false
+      # One SQLite database on a single-node ReadWriteOnce claim: never two pods at once.
+      deploymentStrategy:
+        type: Recreate
+      service:
+        type: ClusterIP
+      serviceMonitor:
+        enabled: true
+      defaultDashboardsEnabled: true
+      # 256Mi request: above the 232Mi peak measured in k3d-obs-p3-clean-20261008T234804Z.
+      resources:
+        requests: {cpu: 50m, memory: 256Mi}
+        limits: {cpu: 200m, memory: 512Mi}
+      # The chart's RBAC would read Secrets cluster-wide; grafana-rbac.yaml grants only
+      # get/list/watch on ConfigMaps in monitoring.
+      rbac:
+        create: false
+      sidecar:
+        image:
+          registry: quay.io
+          repository: kiwigrid/k8s-sidecar
+          tag: 2.11.2
+        # Applies to both sidecars. 64Mi limits were OOM-killed in the k3d rehearsal
+        # (k3d-obs-p3-clean-20261008T172438Z); peaks of 74Mi and 94Mi were measured in
+        # k3d-obs-p3-clean-20261008T234804Z, so requests are 128Mi under 256Mi limits.
+        resources:
+          requests: {cpu: 10m, memory: 128Mi}
+          limits: {cpu: 50m, memory: 256Mi}
+        dashboards:
+          resource: configmap
+          # null removes the chart's "ALL": watch only the pod's own namespace.
+          searchNamespace: null
+        datasources:
+          resource: configmap
+      grafana.ini:
+        analytics:
+          reporting_enabled: false
+          check_for_updates: false
+          check_for_plugin_updates: false
+        auth.anonymous:
+          enabled: false
+        users:
+          allow_sign_up: false
+        plugins:
+          preinstall_disabled: true
