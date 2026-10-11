@@ -1,0 +1,26 @@
+# Grafana sidecar access (observability Phase 3; grafana.rbac.create is false). The
+# dashboard and datasource sidecars read only ConfigMaps in monitoring: no Secrets, no
+# other namespaces, no cluster-wide access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-configmap-reader
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-configmap-reader
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: grafana-configmap-reader
+subjects:
+  - kind: ServiceAccount
+    name: monitoring-kube-prometheus-stack-grafana
+    namespace: monitoring
