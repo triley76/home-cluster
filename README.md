@@ -27,15 +27,18 @@ The active V2 environment includes a deliberately introduced networking service 
 - Flux self-management of `clusters/home/flux-system` from the root Kustomization.
 - Ownership transfer of seven live objects to the child Kustomizations with unchanged UIDs and no Helm upgrade.
 - Normal Flux garbage-collection semantics after the temporary migration protections were removed.
+- A monitoring layer (`monitoring`, `monitoring-configs`) reconciled after `infrastructure-configs`, independent of `apps`: kube-prometheus-stack 91.8.2 with Prometheus, Alertmanager, kube-state-metrics and node-exporter.
+- Grafana, internal only through a `ClusterIP` Service: `restricted` Pod Security, a ConfigMap-only Role, admin credentials from an out-of-band Secret that is not in Git, and a 1 GiB `local-path` claim. It was validated by exact-commit k3d clean-bootstrap and upgrade rehearsals and by the live rollout.
 
-See [MetalLB L2 validation](docs/validation/metallb-l2.md) and [Flux reconciliation-split validation](docs/validation/flux-reconciliation-split.md) for the observed test evidence and its limits.
+See [MetalLB L2 validation](docs/validation/metallb-l2.md), [Flux reconciliation-split validation](docs/validation/flux-reconciliation-split.md) and [observability validation](docs/validation/observability.md) for the observed test evidence and its limits.
 
 
 ### Planned
 
 - Explicit ingress-controller selection and validation.
 - Deliberate persistent-storage design.
-- Observability and backup/restore.
+- Remaining observability work: Flux and MetalLB scrape targets, platform alert rules and dashboards, and alert delivery.
+- Backup/restore.
 - Platform-specific GitOps overlays for K3s, Azure Kubernetes Service (AKS), and Amazon Elastic Kubernetes Service (EKS).
 - Terraform-managed cloud infrastructure.
 - Application and AIStudio workload integration.
@@ -45,17 +48,21 @@ See [MetalLB L2 validation](docs/validation/metallb-l2.md) and [Flux reconciliat
 ```text
 clusters/
 └── home/
-    ├── kustomization.yaml      # Root: flux-system, infrastructure.yaml, apps.yaml
+    ├── kustomization.yaml      # Root: flux-system, infrastructure.yaml, apps.yaml, monitoring.yaml
     ├── flux-system/            # Flux-generated controllers and synchronization (self-managed)
     ├── infrastructure.yaml     # Flux Kustomizations: infrastructure-controllers, infrastructure-configs
     ├── apps.yaml               # Flux Kustomization: apps (depends on infrastructure-configs)
+    ├── monitoring.yaml         # Flux Kustomizations: monitoring (depends on infrastructure-configs), monitoring-configs
     ├── infrastructure/
     │   ├── controllers/        # MetalLB HelmRepository and HelmRelease
     │   └── configs/            # MetalLB IPAddressPool and L2Advertisement
-    └── apps/                   # Validated workloads
+    ├── apps/                   # Validated workloads
+    └── monitoring/
+        ├── controllers/        # Namespaces, kube-prometheus-stack HelmRepository and HelmRelease, Grafana Role
+        └── configs/            # Empty until observability Phase 4
 ```
 
-Reconciliation order: `flux-system` → `infrastructure-controllers` → `infrastructure-configs` → `apps`. See the [reconciliation-split design](docs/design/flux-reconciliation-split.md).
+Reconciliation order: `flux-system` → `infrastructure-controllers` → `infrastructure-configs`, then `apps` and `monitoring` → `monitoring-configs` as independent branches. See the [reconciliation-split design](docs/design/flux-reconciliation-split.md) and the [observability design](docs/design/observability.md).
 
 The structure will evolve as K3s, AKS, and EKS environments are implemented. Shared resources will be separated from environment-specific networking, ingress, storage, and cloud integrations.
 
@@ -71,6 +78,8 @@ The VMware/K3s platform has demonstrated:
 
 The Flux reconciliation split was applied in place. No interruption was observed during the Phase 3 migration window, at the LAN monitor's sample rate. The later Phase 4 monitor recorded failures during an unrelated host reboot, as described in the validation record. Clean-bootstrap ordering was tested in k3d only.
 
+Grafana's clean bootstrap and upgrade were rehearsed in single-node k3d. After the live rollout, no interruption was observed within two separate one-hour windows (a Windows LAN canary monitor and a Linux cluster and Grafana monitor), each at its own sample rate.
+
 That testing does not establish:
 
 - Measured zero-downtime failover
@@ -78,9 +87,10 @@ That testing does not establish:
 - A clean bootstrap of the VMware/K3s cluster
 - Two-node or multi-node failure tolerance
 - Production readiness
-- Persistent-storage recovery
+- Persistent-storage recovery, including Grafana's node-local `local-path` volume
+- Highly available or multi-node Grafana, or encrypted external access to it
 - Completed AKS or EKS implementations
-- Completed ingress, observability, or backup services
+- Completed ingress or backup services, or the remaining observability work (Flux and MetalLB scrape targets, platform alerts, alert delivery)
 
 Claims in this repository are updated only after implementation and validation evidence exists.
 
