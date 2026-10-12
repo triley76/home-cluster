@@ -1,6 +1,6 @@
 # Design: constrained observability with kube-prometheus-stack
 
-**Status:** Proposed. Design only. Nothing is installed or applied, and no manifests change until this design is reviewed and approved. Each implementation phase below is a separate PR.
+**Status:** Phases 1–3 are implemented: CI validation, the monitoring controllers layer, and secured Grafana (merged as `main@sha1:f140bc5334ef0746102c4fcf0cc76561a14689ed`). Phase 3 evidence and its limits are recorded in the [observability validation record](../validation/observability.md). Phases 4 and 5 are not yet implemented. Each implementation phase below is a separate PR.
 
 This design follows the safety model of the [Flux reconciliation-split design](flux-reconciliation-split.md): evidence first, one coherent change per PR, static validation and a disposable k3d rehearsal before merge, explicit stop conditions and rollback, and documentation limited to what was observed.
 
