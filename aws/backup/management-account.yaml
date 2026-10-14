@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Routine IAM Identity Center access for home-cluster backup operations.
+
+Parameters:
+  IdentityCenterInstanceArn:
+    Type: String
+  BackupOperatorPrincipalId:
+    Type: String
+    NoEcho: true
+  BackupOperatorPrincipalType:
+    Type: String
+    AllowedValues:
+      - GROUP
+      - USER
+    Default: GROUP
+  MemberAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    NoEcho: true
+  BackupBucketName:
+    Type: String
+    AllowedPattern: '^home-cluster-backup-[a-z0-9]{8,32}$'
+
+Resources:
+  BackupOperatorPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: HomeClusterBackupOperator
+      Description: Routine backup verification, recovery-material upload and rehearsal download; no bucket administration.
+      SessionDuration: PT2H
+      InlinePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: InspectBucketProtections
+            Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetBucketOwnershipControls
+              - s3:GetBucketPolicyStatus
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketVersioning
+              - s3:GetEncryptionConfiguration
+              - s3:GetLifecycleConfiguration
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}'
+          - Sid: ReadBackupObjectsForVerificationAndRehearsal
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/etcd/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/volumes/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/recovery/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/evidence/*'
+          - Sid: UploadHumanManagedArtifacts
+            Effect: Allow
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/recovery/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BackupBucketName}/evidence/*'
+          - Sid: InspectMachineCredentialReport
+            Effect: Allow
+            Action:
+              - iam:GenerateCredentialReport
+              - iam:GetCredentialReport
+            Resource: '*'
+      Tags:
+        - Key: project
+          Value: home-cluster
+        - Key: purpose
+          Value: backup-operations
+
+  BackupOperatorAssignment:
+    Type: AWS::SSO::Assignment
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      PermissionSetArn: !GetAtt BackupOperatorPermissionSet.PermissionSetArn
+      PrincipalId: !Ref BackupOperatorPrincipalId
+      PrincipalType: !Ref BackupOperatorPrincipalType
+      TargetId: !Ref MemberAccountId
+      TargetType: AWS_ACCOUNT
+
+Outputs:
+  BackupOperatorPermissionSetArn:
+    Value: !GetAtt BackupOperatorPermissionSet.PermissionSetArn
