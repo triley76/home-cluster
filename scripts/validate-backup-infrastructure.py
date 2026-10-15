@@ -55,6 +55,10 @@ def main() -> int:
         "Sid: DenySSEC",
         "Sid: DenyBucketDeletion",
         "s3:DeleteObjectVersion",
+        "s3:BypassGovernanceRetention",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutEncryptionConfiguration",
     ):
         require(member, token, MEMBER)
     for forbidden in ("AWS::IAM::AccessKey", "LoginProfile:", "aws:kms", "SSEAlgorithm: aws:kms"):

@@ -180,11 +180,14 @@ Resources:
               - s3:DeleteBucket
               - s3:DeleteBucketPolicy
               - s3:DeleteObjectVersion
-              - s3:PutBucketEncryption
+              - s3:BypassGovernanceRetention
+              - s3:PutBucketObjectLockConfiguration
+              - s3:PutBucketOwnershipControls
               - s3:PutLifecycleConfiguration
               - s3:PutBucketPolicy
               - s3:PutBucketPublicAccessBlock
               - s3:PutBucketVersioning
+              - s3:PutEncryptionConfiguration
             Resource:
               - !GetAtt BackupBucket.Arn
               - !Sub '${BackupBucket.Arn}/*'

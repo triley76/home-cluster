@@ -195,6 +195,12 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install CloudFormation linter
+        run: pip install --disable-pip-version-check cfn-lint==1.57.2
+
+      - name: Lint CloudFormation templates
+        run: cfn-lint aws/backup/member-account.yaml aws/backup/management-account.yaml
+
       - name: Validate backup infrastructure
         run: python3 scripts/validate-backup-infrastructure.py
 
