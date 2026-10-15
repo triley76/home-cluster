@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Home-cluster off-cluster backup bucket and least-privilege machine identities.
+
+Parameters:
+  BackupBucketName:
+    Type: String
+    AllowedPattern: '^home-cluster-backup-[a-z0-9]{8,32}$'
+    ConstraintDescription: Use home-cluster-backup- followed by an 8-32 character random lowercase suffix.
+
+Resources:
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BackupBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          - Id: RetainEtcdHistory
+            Status: Enabled
+            Prefix: etcd/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 14
+          - Id: RetainVolumeHistory
+            Status: Enabled
+            Prefix: volumes/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+          - Id: RetainRecoveryHistory
+            Status: Enabled
+            Prefix: recovery/
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          - Id: RetainEvidence
+            Status: Enabled
+            Prefix: evidence/
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: project
+          Value: home-cluster
+        - Key: purpose
+          Value: backup
+
+  EtcdBackupUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: home-cluster-etcd-backup
+      Tags:
+        - Key: project
+          Value: home-cluster
+        - Key: purpose
+          Value: etcd-backup
+      Policies:
+        - PolicyName: home-cluster-etcd-prefix
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListEtcdPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - etcd/*
+              - Sid: ManageEtcdObjects
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/etcd/*'
+
+  VeleroBackupUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: home-cluster-velero
+      Tags:
+        - Key: project
+          Value: home-cluster
+        - Key: purpose
+          Value: volume-backup
+      Policies:
+        - PolicyName: home-cluster-volumes-prefix
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListVolumesPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - volumes/*
+              - Sid: ManageVolumeObjects
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/volumes/*'
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+          - Sid: DenyOldTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              NumericLessThan:
+                s3:TlsVersion: '1.2'
+          - Sid: DenySSEC
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              'Null':
+                s3:x-amz-server-side-encryption-customer-algorithm: 'false'
+          - Sid: DenyBucketDeletion
+            Effect: Deny
+            Principal: '*'
+            Action: s3:DeleteBucket
+            Resource: !GetAtt BackupBucket.Arn
+          - Sid: DenyMachineAdministration
+            Effect: Deny
+            Principal:
+              AWS:
+                - !GetAtt EtcdBackupUser.Arn
+                - !GetAtt VeleroBackupUser.Arn
+            Action:
+              - s3:DeleteBucket
+              - s3:DeleteBucketPolicy
+              - s3:DeleteObjectVersion
+              - s3:BypassGovernanceRetention
+              - s3:PutBucketObjectLockConfiguration
+              - s3:PutBucketOwnershipControls
+              - s3:PutLifecycleConfiguration
+              - s3:PutBucketPolicy
+              - s3:PutBucketPublicAccessBlock
+              - s3:PutBucketVersioning
+              - s3:PutEncryptionConfiguration
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+          - Sid: DenyEtcdUserOutsideEtcd
+            Effect: Deny
+            Principal:
+              AWS: !GetAtt EtcdBackupUser.Arn
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            NotResource: !Sub '${BackupBucket.Arn}/etcd/*'
+          - Sid: DenyVeleroUserOutsideVolumes
+            Effect: Deny
+            Principal:
+              AWS: !GetAtt VeleroBackupUser.Arn
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            NotResource: !Sub '${BackupBucket.Arn}/volumes/*'
+
+Outputs:
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  EtcdBackupUserName:
+    Value: !Ref EtcdBackupUser
+  VeleroBackupUserName:
+    Value: !Ref VeleroBackupUser

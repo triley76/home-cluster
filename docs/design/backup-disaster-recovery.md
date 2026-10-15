@@ -1,6 +1,6 @@
 # Design: off-cluster backup and disaster recovery
 
-**Status:** Design only. Nothing in this document is implemented. No AWS resources, credentials, schedules or backup software exist for it, and no restore has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
+**Status:** Stage 0 preflight is complete. Stage 1 CloudFormation and static validation are proposed but not deployed. No AWS backup bucket, machine credentials, schedules or backup software exist yet, and no restore has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
 
 This design follows the safety model of the [Flux reconciliation-split design](flux-reconciliation-split.md) and the [observability design](observability.md): evidence first, one concern per PR, static validation and a disposable rehearsal before merge, explicit stop conditions and rollback, and documentation limited to what was observed.
 
@@ -17,8 +17,8 @@ This design follows the safety model of the [Flux reconciliation-split design](f
 | Secret encryption at rest | **A separate prerequisite stage**, completed before any etcd snapshot leaves the cluster; see [Secrets encryption at rest](#secrets-encryption-at-rest-prerequisite-stage). |
 | Persistent volumes | Velero file-system backup with the Kopia uploader for the Prometheus and Grafana claims, **conditional on the rehearsal proving that it can read `local-path` volumes**. |
 | Recovery material | The K3s server token, the Grafana admin credential, the Velero repository password and (after the prerequisite stage) the K3s encryption configuration. Each is encrypted client-side with `age` to an offline-held key before upload, and is uploaded by a human administrator, never by a machine identity. |
-| AWS provisioning | CloudFormation, deployed by a human administrator through an IAM Identity Center session. Access keys are never created by the template. Recommended, not yet approved; see [Open decisions](#open-decisions). |
-| Stage order | Adds the secrets-encryption prerequisite and moves recovery material ahead of the etcd uploads. This differs from the requested order and needs approval; see [Implementation plan](#implementation-plan-one-concern-per-pr). |
+| AWS provisioning | CloudFormation in this repository outside `clusters/`, deployed by a human administrator through an IAM Identity Center session. Access keys are never created by the template. **Approved for Stage 1.** |
+| Stage order | Adds the secrets-encryption prerequisite and moves recovery material ahead of the etcd uploads. **Approved.** |
 
 ## Goals
 
@@ -26,7 +26,7 @@ This design follows the safety model of the [Flux reconciliation-split design](f
 2. Make every copy restorable, and prove it by isolated restore rehearsal before claiming it.
 3. Keep every secret out of Git, logs and evidence. Material that would expose a secret is encrypted on the source host before it leaves it.
 4. Give machine identities only what they need: write to their own prefix, and no ability to destroy object history or change bucket protections.
-5. Stay below the existing $5 monthly organization budget under expected use, with margin for a restore rehearsal.
+5. Stay below the existing $10 monthly organization budget under expected use, with margin for a restore rehearsal.
 6. State explicit recovery objectives, and measure them in the rehearsal rather than assuming them.
 
 ## Non-goals
@@ -56,7 +56,7 @@ These facts were supplied by the repository owner for this design. They are re-v
 | AWS account | A member account in an AWS Organization; region `us-east-1`. The account ID is not recorded in Git |
 | Human administration | IAM Identity Center with MFA; temporary `AdministratorAccess` sessions |
 | S3 | No buckets exist in the member account. The AWS-managed key `alias/aws/s3` is available |
-| Cost control | An organization-wide $5 monthly AWS Budget in the management account, with three alerts and a verified recipient |
+| Cost control | An organization-wide $10 monthly AWS Budget in the management account, with three alerts and a verified recipient |
 
 Consequences that shape this design:
 
@@ -114,7 +114,7 @@ Backups cover cluster state, volumes and recovery material. A complete rebuild a
 
 Placement by repository:
 
-- **AWS resources**: an infrastructure-as-code template, reviewed in a PR and deployed by a human. The repository location is an [open decision](#open-decisions).
+- **AWS resources**: CloudFormation under `aws/backup/`, outside `clusters/`, reviewed in a PR and deployed by a human.
 - **K3s server configuration** (secrets encryption, etcd S3 upload): server configuration is provisioned by [homelab-k3s](https://github.com/triley76/homelab-k3s), so those changes are PRs there. This repository records the design and the evidence.
 - **Velero**: Flux-managed in this repository, as a new `backup` layer:
 
@@ -154,7 +154,7 @@ The bucket uses **SSE-S3** (`AES256`, S3-managed keys).
 
 Why SSE-S3 rather than a customer-managed KMS key initially:
 
-- **Cost.** A customer-managed key costs $1 per month, before request charges, plus additional charges for rotated key material at current published pricing. That alone is 20% of the $5 budget. SSE-S3 has no key or request charges.
+- **Cost.** A customer-managed key costs $1 per month, before request charges, plus additional charges for rotated key material at current published pricing. That alone is 10% of the $10 budget. SSE-S3 has no key or request charges.
 - **The threat it would address is handled elsewhere.** A customer-managed key's main benefit is a second, independent authorization: reading an object needs both S3 and KMS permissions. Here the sensitive material does not rely on server-side encryption:
   - Velero volume data is encrypted client-side by Kopia;
   - recovery material is encrypted client-side with `age`;
@@ -938,14 +938,10 @@ Do **not** claim:
 
 ## Open decisions
 
-1. **Stage order:** approve moving recovery material before the etcd uploads, and adding the secrets-encryption prerequisite stage.
-2. **Encryption setting:** confirm SSE-S3 (`AES256`), given that `alias/aws/s3` would mean SSE-KMS.
-3. **AWS provisioning tool and location:**
-   - CloudFormation, deployed from an SSO session, is recommended. It needs no state file, which would otherwise hold ARNs containing the account ID, and it supports termination protection;
-   - Terraform matches the README's plan, but needs a state backend;
-   - the repository is open: this one (outside `clusters/`), homelab-k3s, or a new infrastructure repository.
-4. **Committed identifiers:** whether the bucket name (needed by the Velero storage location under Flux) and the public `age` recipient are committed. Neither is a secret; the account ID is never committed.
-5. **etcd identity granularity:** one shared identity (recommended) or one per server.
+1. **Stage order:** resolved — recovery material precedes etcd uploads, with secrets encryption as a prerequisite.
+2. **Encryption setting:** resolved — SSE-S3 (`AES256`).
+3. **AWS provisioning tool and location:** resolved — CloudFormation in this repository under `aws/backup/`, outside `clusters/`, deployed through SSO.\n4. **Committed identifiers:** whether the bucket name (needed by the Velero storage location under Flux) and the public `age` recipient are committed. Neither is a secret; the account ID is never committed.
+5. **etcd identity granularity:** resolved — one shared identity.
 6. **Key-expiry backstop:** whether to add the `aws:CurrentTime` condition that ends grants 120 days after each rotation.
 7. **Alert delivery and external freshness check:** the backup design depends on alert delivery for unattended operation. Choose an external freshness check, for example a scheduled read-only check from a host outside the cluster, or keep the weekly manual check.
 8. **Rehearsal environment:**
@@ -955,6 +951,6 @@ Do **not** claim:
 10. **etcd snapshot compression:** enable it (recommended) and rehearse a compressed restore.
 11. **S3 Object Lock:** reconsider in governance mode after the first rehearsal.
 12. **Logging:** CloudTrail data events for `recovery/` only (low volume, small cost), or none. Confirm whether an organization trail already records management events for the member account.
-13. **Routine permission-set details:** the permission set itself is now part of the plan ([Human access](#human-access)). Still open are its exact action list, and whether it may manage the rehearsal-only identity or that stays an administrator task.
+13. **Routine permission-set details:** resolved for Stage 1 — the least-privilege action list is defined in CloudFormation, and the rehearsal-only identity remains an administrator task.
 14. **Offline storage of the `age` identity:** the two locations, and who holds them.
-15. **Cost guard:** whether to add an S3-filtered budget, for example $2, in the management account, in addition to the organization-wide $5 budget.
+15. **Cost guard:** whether to add an S3-filtered budget, for example $2, in the management account, in addition to the organization-wide $10 budget.
