@@ -4,6 +4,9 @@ These CloudFormation templates implement only the AWS foundation described in
 `docs/design/backup-disaster-recovery.md`. They do not create access keys,
 upload data, or change the cluster.
 
+Stage 1 was deployed on 2026-10-15. The observed results and their limits are in
+`docs/validation/aws-backup-foundation.md`.
+
 ## Deployment order
 
 1. Choose a globally unique bucket name of the form

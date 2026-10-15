@@ -29,8 +29,9 @@ The active V2 environment includes a deliberately introduced networking service 
 - Normal Flux garbage-collection semantics after the temporary migration protections were removed.
 - A monitoring layer (`monitoring`, `monitoring-configs`) reconciled after `infrastructure-configs`, independent of `apps`: kube-prometheus-stack 91.8.2 with Prometheus, Alertmanager, kube-state-metrics and node-exporter.
 - Grafana, internal only through a `ClusterIP` Service: `restricted` Pod Security, a ConfigMap-only Role, admin credentials from an out-of-band Secret that is not in Git, and a 1 GiB `local-path` claim. It was validated by exact-commit k3d clean-bootstrap and upgrade rehearsals and by the live rollout.
+- Stage 1 of the backup design, the AWS foundation only: a private, versioned, SSE-S3 bucket in `us-east-1`, two prefix-scoped machine IAM users with no access keys, and a routine `HomeClusterBackupOperator` IAM Identity Center permission set. No backup data has been uploaded and no restore has been rehearsed.
 
-See [MetalLB L2 validation](docs/validation/metallb-l2.md), [Flux reconciliation-split validation](docs/validation/flux-reconciliation-split.md) and [observability validation](docs/validation/observability.md) for the observed test evidence and its limits.
+See [MetalLB L2 validation](docs/validation/metallb-l2.md), [Flux reconciliation-split validation](docs/validation/flux-reconciliation-split.md), [observability validation](docs/validation/observability.md) and [AWS backup foundation validation](docs/validation/aws-backup-foundation.md) for the observed test evidence and its limits.
 
 
 ### Planned
@@ -38,7 +39,7 @@ See [MetalLB L2 validation](docs/validation/metallb-l2.md), [Flux reconciliation
 - Explicit ingress-controller selection and validation.
 - Deliberate persistent-storage design.
 - Remaining observability work: Flux and MetalLB scrape targets, platform alert rules and dashboards, and alert delivery.
-- Backup/restore.
+- Backup/restore beyond the Stage 1 AWS foundation: machine credentials, etcd and volume uploads, recovery material, and restore rehearsals.
 - Platform-specific GitOps overlays for K3s, Azure Kubernetes Service (AKS), and Amazon Elastic Kubernetes Service (EKS).
 - Terraform-managed cloud infrastructure.
 - Application and AIStudio workload integration.
