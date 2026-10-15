@@ -1,6 +1,6 @@
 # Design: off-cluster backup and disaster recovery
 
-**Status:** Stage 0 preflight is complete. Stage 1 CloudFormation and static validation are proposed but not deployed. No AWS backup bucket, machine credentials, schedules or backup software exist yet, and no restore has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
+**Status:** Stage 0 preflight is complete. Stage 1, the AWS foundation, was deployed on 2026-10-15 and verified, as recorded in the [AWS backup foundation validation](../validation/aws-backup-foundation.md): the versioned backup bucket, the two machine IAM users and the `HomeClusterBackupOperator` permission set exist. No machine access keys exist, no backup data or recovery material has been uploaded, no cluster configuration has changed, no off-cluster backup schedule or backup software has been configured, and no restore has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
 
 This design follows the safety model of the [Flux reconciliation-split design](flux-reconciliation-split.md) and the [observability design](observability.md): evidence first, one concern per PR, static validation and a disposable rehearsal before merge, explicit stop conditions and rollback, and documentation limited to what was observed.
 
@@ -940,7 +940,8 @@ Do **not** claim:
 
 1. **Stage order:** resolved — recovery material precedes etcd uploads, with secrets encryption as a prerequisite.
 2. **Encryption setting:** resolved — SSE-S3 (`AES256`).
-3. **AWS provisioning tool and location:** resolved — CloudFormation in this repository under `aws/backup/`, outside `clusters/`, deployed through SSO.\n4. **Committed identifiers:** whether the bucket name (needed by the Velero storage location under Flux) and the public `age` recipient are committed. Neither is a secret; the account ID is never committed.
+3. **AWS provisioning tool and location:** resolved — CloudFormation in this repository under `aws/backup/`, outside `clusters/`, deployed through SSO.
+4. **Committed identifiers:** whether the bucket name (needed by the Velero storage location under Flux) and the public `age` recipient are committed. Neither is a secret; the account ID is never committed.
 5. **etcd identity granularity:** resolved — one shared identity.
 6. **Key-expiry backstop:** whether to add the `aws:CurrentTime` condition that ends grants 120 days after each rotation.
 7. **Alert delivery and external freshness check:** the backup design depends on alert delivery for unattended operation. Choose an external freshness check, for example a scheduled read-only check from a host outside the cluster, or keep the weekly manual check.
