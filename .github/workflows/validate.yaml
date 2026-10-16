@@ -213,10 +213,6 @@ jobs:
   recovery-material:
     name: Recovery material
     runs-on: ubuntu-24.04
-    env:
-      AGE_VERSION: 1.3.2
-      # SHA-256 of age-v1.3.2-linux-amd64.tar.gz from the GitHub release, recorded when pinned.
-      AGE_SHA256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -226,7 +222,12 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Step-scoped: the recovery helpers refuse to run with any AGE_* variable set.
       - name: Install age
+        env:
+          AGE_VERSION: 1.3.2
+          # SHA-256 of age-v1.3.2-linux-amd64.tar.gz from the GitHub release, recorded when pinned.
+          AGE_SHA256: cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
         run: |
           work="$(mktemp -d "${RUNNER_TEMP}/install-age.XXXXXX")"
           trap 'rm -rf "$work"' EXIT
