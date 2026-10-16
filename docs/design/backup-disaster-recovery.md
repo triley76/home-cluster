@@ -498,20 +498,25 @@ Whether Flux and Helm adopt or replace the Velero-restored objects without losin
 
 **Tool: `age`**, with an X25519 recipient key.
 
-- Encryption needs only the public recipient, so the hosts that encrypt never hold a decryption secret.
-- The private identity is created offline. **An ordinary `age` X25519 identity file is plaintext; it is not passphrase-protected by default.** The Stage 2 runbook must use, and test, one documented protection method before the identity is stored:
-  - the identity file is itself encrypted with an approved passphrase-based `age` workflow, and the plaintext identity exists only in tmpfs during use; or
-  - the identity is kept only on appropriately protected offline encrypted media.
+- Encryption needs only the public recipient, so encrypting never requires a decryption secret. **Verification is the exception.** Source-host verification temporarily makes the passphrase-encrypted identity archive available to the source host:
+  - the private identity may exist only in `age` process memory, or in a root-owned tmpfs;
+  - the archive copy is removed when verification ends;
+  - the archive passphrase is entered only at `age`'s `/dev/tty` prompt, never through command arguments, environment variables, files, stdin pipelines or logs.
+- **An ordinary `age` X25519 identity file is plaintext; it is not passphrase-protected by default.** The protection chosen in Stage 2, as reported by the repository owner:
+  - the identity was generated directly onto BitLocker-protected removable media, and is held offline when the media is disconnected;
+  - two offline copies exist on separate BitLocker AES-256 USB media: Recovery A, kept locally, and Recovery B, kept off-site. Auto-unlock is disabled on both. Each was unlocked and decrypted a non-secret test ciphertext. Recovery B's location and holder are not recorded in Git;
+  - a third, online copy is a passphrase-encrypted identity archive, synchronized to OneDrive with the public recipient and non-secret instructions. Before synchronization, it was decrypted and compared byte-for-byte with the identity. Its ciphertext SHA-256 is `202E17734BB08E56BE97A4EE30049F0F17875FF688714CFB6CED2840080A602E`. It does not replace either offline copy, and its protection rests on the passphrase;
+  - no plaintext identity exists in OneDrive or in the repository.
 
-  Either way, two separate offline copies are kept, one away from the cluster's site. The runbook test must prove that each stored copy can be unlocked and that it decrypts a test ciphertext. The test records only the outcome.
-- The public recipient may be committed for use by scripts; see [Open decisions](#open-decisions).
+  The [Stage 2 runbook](../runbooks/encrypted-recovery-material.md) records the procedure. Each copy's unlock test records only the outcome.
+- The public recipient is committed at [`recovery/home-cluster-recovery-recipient.txt`](../../recovery/home-cluster-recovery-recipient.txt) for use by scripts.
 
 **Handling rules.** No plaintext token, Grafana password, access key or encryption password may enter Git, logs or evidence.
 
 - Encrypt on the host that holds the secret, reading the source file directly, for example `age -r <recipient> -o <name>.age <source>`. Never pipe secrets through `echo`, put them on a command line, or display them.
 - Only ciphertext leaves the source host. It is copied to the administrator workstation and uploaded to `recovery/` in an SSO session using the routine permission set ([Human access](#human-access)). Machine identities cannot read or write `recovery/`.
 - `umask 077`, shell tracing off, no `--debug`, and history disabled for the session.
-- Decrypted plaintext exists only in tmpfs. After use, it is removed and that temporary environment is torn down: the tmpfs is unmounted, or the disposable host is destroyed. `shred` is not relied on: it does not guarantee secure deletion on SSD-backed or copy-on-write storage, which is why plaintext never touches persistent disk.
+- Decrypted plaintext exists only in tmpfs, on a host with no active swap device, because tmpfs pages can be written to swap. After use, it is removed and that temporary environment is torn down: the tmpfs is unmounted, or the disposable host is destroyed. `shred` is not relied on: it does not guarantee secure deletion on SSD-backed or copy-on-write storage, which is why plaintext never touches persistent disk.
 - Verification:
   - immediately after upload, download the object;
   - decrypt it only on a host that already holds the plaintext, into memory-backed storage;
@@ -526,7 +531,7 @@ A verified recovery copy shows that the ciphertext decrypts to the current value
 
 The individual files are not enough to rebuild from. A recovery-material inventory records everything a restore needs, and where each item is. **It contains no secret values**: it points to secrets and records their verification state, but never holds them.
 
-The blank template is part of the Stage 2 runbook in Git. A filled copy is kept with the recovery material as `age` ciphertext, plus an offline copy. The filled copy is kept out of Git, because it holds backup identifiers and version IDs. It is updated whenever an item changes, and reviewed quarterly.
+The [blank template](../runbooks/recovery-material-inventory-template.md) is part of the Stage 2 runbook in Git. A filled copy is kept with the recovery material as `age` ciphertext, plus an offline copy on the recovery media. While it is prepared, its plaintext exists only in a private tmpfs with swap disabled, never on persistent disk. The filled copy is kept out of Git, because it holds backup identifiers and version IDs. It is updated whenever an item changes, and reviewed quarterly.
 
 | Item | Recorded in the inventory (never the secret itself) |
 | --- | --- |
@@ -686,7 +691,7 @@ This design proposes two changes, **which need approval**:
 | --- | --- | --- | --- |
 | 0 | Preflight | None | None (read-only) |
 | 1 | AWS storage and IAM | IaC template for the bucket, its policy, lifecycle and protections, the two IAM users and their policies. **No access keys.** The definition of the routine least-privilege permission set ([Human access](#human-access)). Static checks for account IDs and key patterns | Bucket and IAM users created through the existing administrator session; the routine permission set created or approved |
-| 2 | Encrypted recovery material | Runbook and a helper script for encrypt, upload and verify; the public `age` recipient if approved | Ciphertext of the token and the Grafana credential uploaded and verified |
+| 2 | Encrypted recovery material | The [runbook](../runbooks/encrypted-recovery-material.md); helper scripts to encrypt and verify on the source host and to upload and download with the routine role; the blank inventory template; static checks; the public `age` recipient | Ciphertext of the token, the Grafana credential and the filled inventory uploaded, downloaded and verified |
 | 3 | Secrets encryption at rest | homelab-k3s server configuration; the documented K3s procedure for `v1.36.4+k3s1`, recorded step by step; runbook and evidence here | The rehearsed multi-server procedure (enable, re-encrypt, one key rotation); encryption-recovery material added to the recovery material if separately required |
 | 4 | etcd off-cluster backups | homelab-k3s drop-in for S3 upload (credentials from encrypted variables); the freshness rule here, if the observability Phase 4 custom-resource metrics exist | Etcd access key created; snapshots uploaded |
 | 5 | Volume backups | `backup.yaml` and `clusters/home/backup/`; CI catalog update for Velero CRDs; Pod Security and RBAC checks | Velero installed; Velero key and repository password created out of band beforehand; schedules start |
@@ -707,6 +712,7 @@ Stages 2–5 each start with a fresh on-demand local etcd snapshot as their reco
   - every image tag explicit;
   - no `Secret` manifests under `backup/`.
 - Stage 1: template linting; IAM Access Analyzer policy validation, from an SSO session at implementation time; review against the policy table above.
+- Stage 2: the repository-wide recovery-material scan and its mutation tests; helper tests with a throwaway identity and a stub AWS CLI. They do not exercise production `sudo`, the tmpfs mount, the swap check, the passphrase prompt, SSH, AWS or S3.
 - Stage 5:
   - `helm template` of the Velero chart with the proposed values, validated with kubeconform against the Velero CRDs;
   - Kustomization membership;
@@ -941,7 +947,11 @@ Do **not** claim:
 1. **Stage order:** resolved — recovery material precedes etcd uploads, with secrets encryption as a prerequisite.
 2. **Encryption setting:** resolved — SSE-S3 (`AES256`).
 3. **AWS provisioning tool and location:** resolved — CloudFormation in this repository under `aws/backup/`, outside `clusters/`, deployed through SSO.
-4. **Committed identifiers:** whether the bucket name (needed by the Velero storage location under Flux) and the public `age` recipient are committed. Neither is a secret; the account ID is never committed.
+4. **Committed identifiers:**
+   - the public `age` recipient: resolved — committed in Stage 2;
+   - the bucket name (needed by the Velero storage location under Flux): still open, and not committed before Stage 5.
+
+   Neither is a secret; the account ID is never committed.
 5. **etcd identity granularity:** resolved — one shared identity.
 6. **Key-expiry backstop:** whether to add the `aws:CurrentTime` condition that ends grants 120 days after each rotation.
 7. **Alert delivery and external freshness check:** the backup design depends on alert delivery for unattended operation. Choose an external freshness check, for example a scheduled read-only check from a host outside the cluster, or keep the weekly manual check.
@@ -953,5 +963,5 @@ Do **not** claim:
 11. **S3 Object Lock:** reconsider in governance mode after the first rehearsal.
 12. **Logging:** CloudTrail data events for `recovery/` only (low volume, small cost), or none. Confirm whether an organization trail already records management events for the member account.
 13. **Routine permission-set details:** resolved for Stage 1 — the least-privilege action list is defined in CloudFormation, and the rehearsal-only identity remains an administrator task.
-14. **Offline storage of the `age` identity:** the two locations, and who holds them.
+14. **Offline storage of the `age` identity:** resolved — Recovery A is kept locally and Recovery B off-site, with a passphrase-encrypted online copy in addition; see [Recovery material](#recovery-material-and-client-side-encryption). The off-site location and its holder are not recorded in Git.
 15. **Cost guard:** whether to add an S3-filtered budget, for example $2, in the management account, in addition to the organization-wide $10 budget.

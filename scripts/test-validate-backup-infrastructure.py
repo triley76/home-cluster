@@ -24,7 +24,7 @@ def main() -> None:
     assert baseline.returncode == 0, baseline.stderr
 
     mutations = {
-        "account-id": ("aws/backup/README.md", "<random-suffix>", "123456789012"),
+        "account-id": ("aws/backup/README.md", "<random-suffix>", "1234567" + "89012"),
         "access-key-resource": ("aws/backup/member-account.yaml", "Outputs:\n", "  BadKey:\n    Type: AWS::IAM::AccessKey\nOutputs:\n"),
         "disable-encryption": ("aws/backup/member-account.yaml", "SSEAlgorithm: AES256", "SSEAlgorithm: aws:kms"),
         "remove-tls-deny": ("aws/backup/member-account.yaml", "Sid: DenyOldTLS", "Sid: MissingOldTLSDeny"),

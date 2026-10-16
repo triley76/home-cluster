@@ -19,6 +19,14 @@ kubeconfig
 kubeconfig.*
 secrets/
 credentials/
+.aws/
+
+# Recovery material: ciphertext, age identities and filled inventories stay outside Git.
+# Only the public recipient under recovery/ and the blank inventory template are committed.
+*.age
+keys.txt
+*identity*.txt
+recovery-material-inventory.md
 
 # Terraform local state and generated files
 .terraform/
