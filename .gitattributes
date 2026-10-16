@@ -1,2 +1,4 @@
 # Shell scripts must keep LF endings so they run under bash on any checkout.
 *.sh text eol=lf
+# The public age recipient must stay one LF-terminated line on every checkout.
+recovery/*.txt text eol=lf

@@ -14,12 +14,25 @@ Do not commit:
 - Plaintext Kubernetes Secret values
 - Terraform state or unreviewed variable files
 - Credentials embedded in URLs, manifests, scripts, or documentation
+- `age` private identities, identity-archive passphrases, or passphrase hints
+- The K3s server token, or any hash or fingerprint of it
+- `age` ciphertext of recovery material, or a filled recovery-material inventory
 
 Before committing, inspect staged content:
 
 ```bash
 git diff --cached
 ```
+
+The public `age` recipient in `recovery/` is not a secret, but reviews in this repository do not print it. Exclude it from the diff and check it by format instead:
+
+```bash
+git diff --cached -- . ':(exclude)recovery/home-cluster-recovery-recipient.txt'
+git show :recovery/home-cluster-recovery-recipient.txt | python3 scripts/validate-recovery-material.py --check-recipient -
+python3 scripts/validate-recovery-material.py
+```
+
+The repository scan reports findings by path, line number and rule name only, never the matched text.
 
 Repository history and current tracked content should be scanned before changing repository visibility.
 
