@@ -241,7 +241,7 @@ set -e
 if [[ "$term_rc" -eq 143 ]] && empty_dir "$term_dir"; then
   pass "TERM during decryption cleans up and exits 143"
 else
-  fail "TERM during decryption cleans up and exits 143" "exit ${term_rc}; tmpdir contents: $(ls -A "$term_dir" | tr '\n' ' ')"
+  fail "TERM during decryption cleans up and exits 143" "exit ${term_rc}; tmpdir contents: $(find "$term_dir" -mindepth 1 -maxdepth 1 -printf '%f ')"
 fi
 
 # --- group B: real round trips ------------------------------------------------------

@@ -182,6 +182,8 @@ cmd_check_recipient() {
 write_exclusive() {
   local target="$1"
   if (( ! test_mode )) && [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    # $1 is expanded by the child shell, which receives "$target" as its first argument.
+    # shellcheck disable=SC2016
     runuser -u "$SUDO_USER" -- bash -c 'umask 077; set -C; exec cat >"$1"' write_exclusive "$target"
   else
     (set -C; exec cat >"$target")
