@@ -1,6 +1,6 @@
 # Runbook: encrypted recovery material (Stage 2)
 
-**Status:** not yet executed. This runbook, its helpers and its checks are implemented, but no recovery material has been encrypted, uploaded, downloaded or verified. Stage 2 is complete only when the K3s server token, the Grafana admin credential and the filled recovery-material inventory have each been encrypted, uploaded, downloaded and verified, and the results are recorded in a validation record.
+**Status:** executed from 2026-10-16 to 2026-10-19 UTC. The K3s server token, the Grafana admin credential and the filled recovery-material inventory were each encrypted, uploaded, downloaded by exact version and verified, and the inventory was copied to Recovery A and Recovery B. The results, and a cluster incident that interrupted the run, are recorded in the [encrypted recovery material validation](../validation/encrypted-recovery-material.md). Later runs, after any item changes, follow the same procedure and are recorded the same way.
 
 This runbook implements Stage 2 of the [backup and disaster recovery design](../design/backup-disaster-recovery.md), following its [recovery material and client-side encryption](../design/backup-disaster-recovery.md#recovery-material-and-client-side-encryption) rules.
 
@@ -70,12 +70,17 @@ All Stage 2 AWS operations use the routine `HomeClusterBackupOperator` role. `Ad
 
 ## Prerequisites and live-pass gates
 
-None of these is done yet. Each needs its own explicit approval before the live pass:
+Each live run needs every prerequisite below, and each needs its own explicit approval. For the 2026-10-16 to 2026-10-19 run, the [validation record](../validation/encrypted-recovery-material.md#prerequisites) shows:
+- items 1, 2 and 3 were met;
+- the helpers came from a reviewed commit (item 7);
+- the AWS steps used the routine role through the CLI wrapper described under item 5.
+
+It does not record how the bucket name was configured (item 6), or whether the separate item 4 rehearsal was performed. Every `verify` with the real identity archive reported `MATCH`.
 
 1. **A fresh on-demand local etcd snapshot** as the recovery point (design: Stages 2–5 each start with one). It is a cluster action.
 2. **`age` v1.3.2 on every host that runs `encrypt` or `verify`:**
-   - **`k3s01`**: installed through a homelab-k3s change.
-   - **The WSL workstation**: a separately approved installation. `age` is not currently installed in WSL; the Windows `age.exe` cannot be used by the Linux helper.
+   - **`k3s01`**: installed by the homelab-k3s `recovery-tools` role, using `configure-recovery-tools.yml --limit k3s01`. It was installed and validated for the Stage 2 run.
+   - **The WSL workstation**: a separately approved installation from the pinned Linux amd64 release archive, checksum-verified. It was installed and validated for the Stage 2 run. The Windows `age.exe` cannot be used by the Linux helper.
 
    The helpers never install or download software, and they fail closed when `age` is missing or is any other version.
 3. **Swap disabled on every host that runs `verify` or holds the filled inventory**, so that `swapon --show` prints nothing:
@@ -83,8 +88,10 @@ None of these is done yet. Each needs its own explicit approval before the live 
    - WSL: `swap=0` in `.wslconfig`, then a WSL restart.
 
    `verify` refuses to run while swap is active.
+
+   **Changing swap state on a K3s server is a live node change.** Do it only as a separately approved step, with a fresh snapshot in place. During the Stage 2 run, the first server's local Kubernetes API became unavailable after a temporary swap-state change on that node. The cause was not determined; see the [validation record](../validation/encrypted-recovery-material.md#cluster-incident-and-recovery). If swap is active on a source host, stop and decide separately how to proceed.
 4. **`/dev/tty` passphrase gate.** On each host that will run `verify`, run it once with a throwaway identity archive that you create interactively with `age -p`. This confirms that `age` v1.3.2 prompts on `/dev/tty`, with stdin from `/dev/null` and under `sudo`, and that `MATCH` is reported. The repository tests cannot exercise this, because they would need a terminal and a passphrase.
-5. **The AWS CLI v2 on the workstation**, signed in with `aws sso login --profile home-cluster-backup-operator`.
+5. **The AWS CLI v2 on the workstation**, signed in with `aws sso login --profile home-cluster-backup-operator`. In the Stage 2 run, the CLI used from WSL was a private wrapper around the authenticated Windows AWS CLI. It normalized carriage returns and converted WSL paths for the Windows CLI's file operations. The repository's tests do not cover that wrapper.
 6. **The bucket name** in `HOME_CLUSTER_BACKUP_BUCKET`, or in a mode `600` file at `~/.config/home-cluster/backup-bucket`. It is never committed or printed.
 7. **The helpers and the recipient on the source host**, copied from a reviewed commit with the repository layout kept:
 
