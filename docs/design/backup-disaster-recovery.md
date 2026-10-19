@@ -1,6 +1,10 @@
 # Design: off-cluster backup and disaster recovery
 
-**Status:** Stage 0 preflight is complete. Stage 1, the AWS foundation, was deployed on 2026-10-15 and verified, as recorded in the [AWS backup foundation validation](../validation/aws-backup-foundation.md): the versioned backup bucket, the two machine IAM users and the `HomeClusterBackupOperator` permission set exist. No machine access keys exist, no backup data or recovery material has been uploaded, no cluster configuration has changed, no off-cluster backup schedule or backup software has been configured, and no restore has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
+**Status:** Stage 0 preflight is complete. Stage 1, the AWS foundation, was deployed on 2026-10-15 and verified, as recorded in the [AWS backup foundation validation](../validation/aws-backup-foundation.md): the versioned backup bucket, the two machine IAM users and the `HomeClusterBackupOperator` permission set exist. Stage 2, encrypted recovery material, was completed from 2026-10-16 to 2026-10-19, as recorded in the [encrypted recovery material validation](../validation/encrypted-recovery-material.md):
+- the K3s server token, the Grafana admin credential and the filled inventory are stored in `recovery/` as `age` ciphertext, uploaded with the routine role and verified;
+- the inventory is also held on both offline recovery drives.
+
+A cluster incident during Stage 2 required restoring the cluster from a local etcd snapshot. All three nodes were then validated healthy; the root cause was not determined. No machine access keys exist, no etcd snapshots or volume data have been uploaded by any backup mechanism, no off-cluster backup schedule or backup software has been configured, and no restore from off-cluster material has been rehearsed. Each implementation stage below is a separate, reviewed PR (or a recorded manual action where noted), gated by its own evidence.
 
 This design follows the safety model of the [Flux reconciliation-split design](flux-reconciliation-split.md) and the [observability design](observability.md): evidence first, one concern per PR, static validation and a disposable rehearsal before merge, explicit stop conditions and rollback, and documentation limited to what was observed.
 
