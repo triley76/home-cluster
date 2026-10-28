@@ -5,12 +5,15 @@ Scans every tracked file, and every untracked file that .gitignore does not
 exclude, for:
   - age secret keys and age ciphertext (no ciphertext of any kind belongs in Git);
   - K3s-token-shaped values;
+  - K3s secrets-encryption key material (a 32-byte base64 "secret" value, as in
+    encryption-config.json);
   - 12-digit AWS account IDs, access-key IDs and secret-access-key assignments;
   - file names that suggest secret material (identities, tokens, ciphertext,
-    credentials, filled inventories);
+    credentials, encryption configurations, filled inventories);
 and checks that:
   - recovery/ holds exactly the committed public recipient, in the expected format;
-  - the blank inventory template contains placeholders only;
+  - the blank inventory template contains placeholders only, keeps every required
+    row, and has no field for a plaintext-derived value;
   - the recovery-material helpers do not enable tracing or print or hash plaintext.
 
 A finding is reported as path, line number and rule name only. Matched text is
@@ -46,6 +49,7 @@ CONTENT_RULES = (
     ("age-secret-key", re.compile(re.escape(AGE_SECRET_MARKER))),
     ("k3s-token", re.compile(r"K10[0-9a-fA-F]{64}::[A-Za-z]+:\S+")),
     ("k3s-token", re.compile(r"(?<![\w-])(?:server|node):[0-9a-f]{32}(?![0-9a-f])")),
+    ("encryption-config-key", re.compile(r"(?i)[\"']?secret[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9+/]{43}=")),
     ("aws-account-id", re.compile(r"(?<![0-9A-Za-z])[0-9]{12}(?![0-9A-Za-z])")),
     ("aws-access-key-id", re.compile(r"(?<![0-9A-Z])(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])")),
     ("aws-secret-access-key", re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+]{40}")),
@@ -61,6 +65,37 @@ HELPER_RULES = (
 SECRET_NAMES = {"keys.txt", "token", "credentials", "kubeconfig", "recovery-material-inventory.md"}
 SECRET_SUFFIXES = {".age", ".pem", ".key", ".p12", ".pfx", ".kubeconfig"}
 PLACEHOLDER = re.compile(r"`?<[^<>`|]+>`?")
+
+# Rows the inventory template must keep, as (item, field); the "Record" table
+# rows have no item. The encryption-configuration rows record its ciphertext,
+# object metadata, exact-version and decryption results and recovery-copy status.
+ENCRYPTION_CONFIG_ITEM = "K3s secrets-encryption configuration"
+REQUIRED_ROWS = (
+    ("", "Previous inventory object"),
+    ("K3s server token", "Object key"),
+    ("K3s server token", "S3 version ID"),
+    ("K3s server token", "Ciphertext SHA-256"),
+    ("K3s server token", "Last verification"),
+    ("Grafana admin credential", "Object key"),
+    ("Grafana admin credential", "S3 version ID"),
+    ("Grafana admin credential", "Ciphertext SHA-256"),
+    ("Grafana admin credential", "Last verification"),
+    (ENCRYPTION_CONFIG_ITEM, "Object key"),
+    (ENCRYPTION_CONFIG_ITEM, "S3 version ID"),
+    (ENCRYPTION_CONFIG_ITEM, "Ciphertext SHA-256"),
+    (ENCRYPTION_CONFIG_ITEM, "Ciphertext bytes"),
+    (ENCRYPTION_CONFIG_ITEM, "Source check"),
+    (ENCRYPTION_CONFIG_ITEM, "Exact-version download comparison"),
+    (ENCRYPTION_CONFIG_ITEM, "Decryption comparison"),
+    (ENCRYPTION_CONFIG_ITEM, "Verification cleanup"),
+    (ENCRYPTION_CONFIG_ITEM, "Key state it follows"),
+    (ENCRYPTION_CONFIG_ITEM, "Recovery-copy status"),
+)
+# A template field must never ask for a plaintext-derived value or key material.
+FORBIDDEN_FIELD = re.compile(
+    r"(?i)\bplaintext\b|\bfingerprint\b|\b(?:prefix|length)\b|\bsecret value\b"
+    r"|\bkey (?:name|value|material|hash)\b|\bencryption key\b|\bplain(?:text)? (?:hash|sha|size)\b"
+)
 
 
 def list_files(root: Path) -> list[str]:
@@ -88,6 +123,7 @@ def secret_name(path: str) -> bool:
         or Path(base).suffix in SECRET_SUFFIXES
         or "identity" in base
         or base.startswith("grafana-admin")
+        or base.startswith("encryption-config")
         or ".aws" in parts
     )
 
@@ -129,15 +165,22 @@ def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
         findings.append((TEMPLATE, 0, "inventory-template-missing"))
     else:
         rows = 0
+        seen = set()
         for number, line in enumerate((root / TEMPLATE).read_text(encoding="utf-8").splitlines(), 1):
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")] if line.lstrip().startswith("|") else []
             if len(cells) < 2 or all(set(cell) <= set("-: ") for cell in cells) or cells[-1] == "Value":
                 continue
             rows += 1
+            seen.add((cells[0] if len(cells) > 2 else "", cells[-2]))
             if not PLACEHOLDER.fullmatch(cells[-1]):
                 findings.append((TEMPLATE, number, "inventory-template-value"))
+            if any(FORBIDDEN_FIELD.search(cell) for cell in cells[:-1]):
+                findings.append((TEMPLATE, number, "inventory-template-forbidden-field"))
         if rows == 0:
             findings.append((TEMPLATE, 0, "inventory-template-empty"))
+        for row in REQUIRED_ROWS:
+            if row not in seen:
+                findings.append((TEMPLATE, 0, "inventory-template-row-missing"))
 
     return sorted(set(findings)), len(files)
 

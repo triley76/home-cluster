@@ -16,6 +16,7 @@ Do not commit:
 - Credentials embedded in URLs, manifests, scripts, or documentation
 - `age` private identities, identity-archive passphrases, or passphrase hints
 - The K3s server token, or any hash or fingerprint of it
+- The K3s secrets-encryption configuration (`encryption-config.json`), any key or key name from it, or any hash or size of it
 - `age` ciphertext of recovery material, or a filled recovery-material inventory
 
 Before committing, inspect staged content:

@@ -16,11 +16,15 @@ It is never created on the WSL virtual disk, the Windows system disk, OneDrive o
 **The inventory points to secrets; it never holds them.** Never write any of these into a filled copy:
 
 - a secret value, or any hash, fingerprint, prefix or length of one;
+- any part of the K3s secrets-encryption configuration: a key, a key name, a provider entry, or a hash or size of the plaintext file;
 - the private identity, the identity-archive passphrase, or a passphrase hint;
 - the off-site location, the holder of Recovery B, or device serial numbers;
 - an AWS account ID, ARN, IAM Identity Center identifier, portal URL or email address.
 
-Every value below is a placeholder. The repository check (`scripts/validate-recovery-material.py`) fails if a value cell in this template is anything else.
+Every value below is a placeholder. The repository check (`scripts/validate-recovery-material.py`) fails if:
+- a value cell in this template is anything else;
+- a required row is missing;
+- a field asks for a plaintext-derived value or key material.
 
 ## Record
 
@@ -40,10 +44,16 @@ Every value below is a placeholder. The repository check (`scripts/validate-reco
 | K3s server token | S3 version ID | `<version ID>` |
 | K3s server token | Ciphertext SHA-256 | `<ciphertext SHA-256>` |
 | K3s server token | Last verification | `<YYYY-MM-DD, cmp -s result>` |
-| K3s secrets-encryption material | Separately required | `<not yet determined until Stage 3, yes, or no>` |
-| K3s secrets-encryption material | Object key | `<object key, or not applicable>` |
-| K3s secrets-encryption material | S3 version ID | `<version ID, or not applicable>` |
-| K3s secrets-encryption material | Last verification | `<YYYY-MM-DD, cmp -s result, or not applicable>` |
+| K3s secrets-encryption configuration | Object key | `<recovery/encryption-config/YYYY-MM-DD.age>` |
+| K3s secrets-encryption configuration | S3 version ID | `<version ID, from the private upload receipt>` |
+| K3s secrets-encryption configuration | Ciphertext SHA-256 | `<ciphertext SHA-256>` |
+| K3s secrets-encryption configuration | Ciphertext bytes | `<ciphertext size in bytes>` |
+| K3s secrets-encryption configuration | Source check | `<PASS: expected path, regular file, nonempty, root:root, no group or other access, directory root:root and not group or other writable>` |
+| K3s secrets-encryption configuration | Exact-version download comparison | `<YYYY-MM-DD, MATCH or DIFFER>` |
+| K3s secrets-encryption configuration | Decryption comparison | `<YYYY-MM-DD, MATCH, DIFFER or ERROR>` |
+| K3s secrets-encryption configuration | Verification cleanup | `<YYYY-MM-DD, tmpfs files removed and tmpfs unmounted: yes or no>` |
+| K3s secrets-encryption configuration | Key state it follows | `<UTC date of the rotate-keys run and p2 snapshot name it follows>` |
+| K3s secrets-encryption configuration | Recovery-copy status | `<verified, unverified, or superseded by YYYY-MM-DD>` |
 | Grafana admin credential | Object key | `<recovery/grafana-admin/YYYY-MM-DD.age>` |
 | Grafana admin credential | S3 version ID | `<version ID>` |
 | Grafana admin credential | Ciphertext SHA-256 | `<ciphertext SHA-256>` |

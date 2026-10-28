@@ -13,8 +13,9 @@ A verified recovery copy shows that the ciphertext decrypts to the current value
 | `k3s-server-token` | `/var/lib/rancher/k3s/server/token` | `k3s01` | `recovery/k3s-server-token/<YYYY-MM-DD>.age` |
 | `grafana-admin` | The protected out-of-band Grafana credential file, recorded in the [observability validation](../validation/observability.md) as `/home/ansible/.config/home-cluster/grafana-admin`; reconfirmed in preflight | `k3s01` | `recovery/grafana-admin/<YYYY-MM-DD>.age` |
 | `recovery-inventory` | A private, memory-backed tmpfs on the workstation while it is prepared ([Inventory](#the-filled-inventory)), and, only if an offline plaintext copy is required, the BitLocker recovery media | The administrative workstation (WSL) | `recovery/recovery-inventory/<YYYY-MM-DD>.age` |
+| `encryption-config` | `/var/lib/rancher/k3s/server/cred/encryption-config.json`, the K3s secrets-encryption configuration that holds the secretbox key (Stage 3). The helper accepts this exact path only. The file must be a nonempty regular file owned by `root:root` with no group or other permissions, in a `root:root` directory that group and others cannot write to | `k3s01` | `recovery/encryption-config/<YYYY-MM-DD>.age` |
 
-The K3s secrets-encryption material (Stage 3) and the Velero repository password (Stage 5) are added by their own stages.
+The `encryption-config` item has its own timing and procedure: see [The K3s secrets-encryption configuration](#the-k3s-secrets-encryption-configuration-stage-3). The Velero repository password (Stage 5) is added by its own stage.
 
 ## The age identity
 
@@ -228,6 +229,160 @@ findmnt -t tmpfs -S recovery-material                                 # must pri
 
 These checks use file names and mount tables only; they never read file contents. Then remove the helper copy (`rm -rf -- ~/hc-recovery`) and confirm with `test ! -e ~/hc-recovery && echo "helper copy: absent"`.
 
+## The K3s secrets-encryption configuration (Stage 3)
+
+**Status:** implemented and tested with synthetic data only. It has not been run against the live cluster; no real configuration has been read, encrypted, uploaded or verified.
+
+The homelab-k3s Stage 3 procedure enables K3s secretbox encryption at rest and rotates its key once. The key exists only in `/var/lib/rancher/k3s/server/cred/encryption-config.json`, identical on every server after the second restart round, and in K3s bootstrap data in etcd, encrypted with the server token. Restoring a post-activation snapshot onto servers that have lost that file, from the snapshot and the token alone, is untested. This recovery copy is therefore required: without the key, every Secret encrypted under it is lost, whatever snapshots survive. The Stage 3 side of this dependency is described in homelab-k3s `docs/secrets-encryption.md`, section "Key material and the off-node recovery copy".
+
+### Timing
+
+- **Make the copy only after all of these, in order:**
+  1. the second (post-rotation) restart round has completed on all three servers;
+  2. the enforced-enabled validation has passed;
+  3. the p2 snapshot has been taken and recorded.
+
+  Never earlier. Before the rotation, the file holds the key that coexisted with plaintext data, and that key is retired by the rotation.
+- **The Stage 3 rollout is not complete until all four checks pass**, for the same object version:
+  1. the upload succeeds;
+  2. the exact-version download succeeds;
+  3. the downloaded ciphertext is byte-identical to the uploaded one (`recovery-material-s3.sh download`: `result: MATCH`);
+  4. the controlled decryption comparison reports `result: MATCH` (`recovery-material.sh verify`).
+
+  Until then, the rollout must not be declared complete.
+- **Any later approved key rotation requires a new verified recovery copy**, made by this same procedure after that rotation's own restart round, validation and snapshot. The earlier copy is marked superseded in the inventory; it is never deleted by the routine role.
+- **No post-activation snapshot may be moved off the node** (p2 or any later snapshot, including the Stage 4 uploads) until the encryption-configuration recovery copy that matches its key state has passed all four checks.
+
+### What is never done
+
+The plaintext configuration, any key, any key name, the plaintext's hash or size, and decrypted output are never printed, logged, displayed, parsed, copied to the controller or workstation, or stored in an Ansible fact or any other variable. Specifically:
+- `age` reads the protected source directly, on `k3s01`. No `cat`, `jq`, `cp`, `sha256sum` or `stat -c %s` is run on it, and no Ansible task reads it.
+- Only ciphertext leaves `k3s01`.
+- Decrypted output exists only inside `verify`'s private tmpfs and is compared there with `cmp -s`.
+
+**The source path is bound.** In production, `recovery-material.sh` accepts `--source` for this item only as exactly `/var/lib/rancher/k3s/server/cred/encryption-config.json`. It refuses, using metadata only:
+- any other path, including another root-owned file;
+- a relative path or an alias, such as `./`, `//`, `..` or a trailing `/`;
+- a symbolic link as the file or as any directory above it;
+- a path whose canonical form (`realpath -e`) is not that exact path;
+- a credential directory (`/var/lib/rancher/k3s/server/cred`) that is missing, is not a directory, is not owned by `root:root`, or is writable by group or others.
+
+The tests stand in for that path with `RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE`, and for the required owners with `RECOVERY_MATERIAL_TEST_SOURCE_OWNER` and `RECOVERY_MATERIAL_TEST_PARENT_OWNER`.
+- They take effect only with `RECOVERY_MATERIAL_TEST=1`, which is refused for root.
+- Outside test mode, the helper refuses to run at all while any of them is set, even empty, so none of them can redirect or relax a production run.
+
+The helpers print metadata only:
+- the item name;
+- the source check: regular file, nonempty, mode, no group or other access, owner `root:root`, expected path, and the credential directory's ownership and writability;
+- the ciphertext path, size and SHA-256;
+- the object key;
+- the path of the private version receipt;
+- `MATCH`, `DIFFER` or `ERROR`;
+- the cleanup result.
+
+**The version ID of this item is never printed.**
+- `upload` requires `--receipt`, and writes the object key and version ID to a new mode `600` file in the inventory tmpfs.
+  - The content is first written to a fresh private file from `mktemp`, which is then hard-linked to the receipt name.
+  - A hard link fails if the name already exists in any form, and never follows or opens it. This includes a receipt, FIFO or symbolic link planted after the helper's preliminary check.
+  - The temporary name is always removed.
+- `download` requires the same receipt, and refuses a receipt for any other object key.
+- The bucket name is never printed, as for every item.
+
+### Procedure
+
+The prerequisites, session hygiene and per-host cleanup are those of the token and Grafana procedure above. Create and verify the inventory tmpfs first ([The filled inventory](#the-filled-inventory), step 1); `$inv` below is that tmpfs.
+
+1. **Preflight on `k3s01`**, metadata only:
+
+   ```bash
+   sudo stat -c '%a %U:%G %F' /var/lib/rancher/k3s/server/cred/encryption-config.json
+   ```
+
+   ```bash
+   sudo stat -c '%a %U:%G %F' /var/lib/rancher/k3s/server/cred
+   ```
+
+   - The first command must print a mode with no group or other permissions, `root:root`, and `regular file`.
+   - The second must print a mode without group or other write permission, `root:root`, and `directory`.
+
+   The helper repeats these checks. It also refuses an empty file, any other file type, any other path, and a symbolic link anywhere in the path.
+2. **Encrypt on `k3s01`:**
+
+   ```bash
+   sudo bash ~/hc-recovery/scripts/recovery-material.sh encrypt --item encryption-config \
+     --source /var/lib/rancher/k3s/server/cred/encryption-config.json \
+     --out ~/hc-recovery/out/encryption-config.age
+   ```
+
+   It prints the source check, ciphertext path, size and SHA-256. Record the size and SHA-256 in the inventory.
+3. **Copy the ciphertext to the workstation**, ciphertext only:
+
+   ```bash
+   scp k3s01:hc-recovery/out/encryption-config.age ~/hc-recovery/encryption-config.age
+   ```
+
+   Check that its SHA-256 equals the value printed in step 2.
+4. **Upload, writing a private receipt:**
+
+   ```bash
+   bash scripts/recovery-material-s3.sh upload --item encryption-config --date <YYYY-MM-DD> \
+     --file ~/hc-recovery/encryption-config.age --receipt "$inv/encryption-config.receipt"
+   ```
+
+   It prints the object key, the receipt path, and the ciphertext size and SHA-256. It refuses to run without `--receipt`, or if the receipt exists, is a link, or sits in a directory with group or other access.
+5. **Download that exact version and compare the ciphertexts:**
+
+   ```bash
+   bash scripts/recovery-material-s3.sh download --item encryption-config --date <YYYY-MM-DD> \
+     --receipt "$inv/encryption-config.receipt" --out ~/hc-recovery/encryption-config.downloaded.age \
+     --compare-with ~/hc-recovery/encryption-config.age
+   ```
+
+   It must print `result: MATCH`. S3 must return the exact version in the receipt, or the download is refused and nothing is written to `--out`.
+6. **Controlled decryption comparison on `k3s01`.**
+   - Copy the downloaded ciphertext, and the identity archive if it is not already there, as in step 5 of the token procedure.
+   - Then run, in an interactive session (`ssh -t k3s01`):
+
+   ```bash
+   sudo bash ~/hc-recovery/scripts/recovery-material.sh verify --item encryption-config \
+     --ciphertext ~/hc-recovery/out/encryption-config.downloaded.age \
+     --source /var/lib/rancher/k3s/server/cred/encryption-config.json \
+     --identity-archive ~/hc-recovery/out/identity-archive.age
+   ```
+
+   `verify` behaves as for the token:
+   - it refuses to run while swap is active;
+   - it decrypts only inside its own root-owned 0700 tmpfs;
+   - it compares with `cmp -s`, and prints `MATCH`, `DIFFER` or `ERROR` with the `cmp` exit status (a failed decryption is `ERROR`);
+   - it removes its files and unmounts the tmpfs on success, failure, `INT`, `TERM` or `HUP`, and turns any cleanup failure into a non-zero exit.
+
+   It must print `result: MATCH`. Afterwards, `findmnt -t tmpfs -S recovery-material` must print nothing.
+7. **Record** these in the filled inventory, inside its tmpfs:
+   - the object key, and the version ID, read from the receipt in the editor (for example with `:r`), never displayed in a terminal;
+   - the ciphertext SHA-256 and size;
+   - the source check;
+   - both comparison results;
+   - the cleanup result;
+   - the rotation and p2 snapshot it follows;
+   - `Recovery-copy status: verified`.
+8. **Run the [per-host cleanup](#per-host-cleanup) on `k3s01`**, then re-encrypt, upload and verify the changed inventory ([The filled inventory](#the-filled-inventory), steps 3 to 5). Its cleanup removes the receipt with the tmpfs.
+
+### Stop conditions for this item
+
+These are in addition to the general [stop conditions](#stop-conditions):
+- the source check fails;
+- any comparison reports `DIFFER` or `ERROR`;
+- the receipt cannot be written after an upload. Treat that version as unverified, and upload again with `--new-version` and a new receipt;
+- the copy was attempted before the second restart round, the enforced-enabled validation and p2.
+
+On any of these, Stage 3 stays incomplete. The cluster keeps running encrypted, with the key on all three servers and in etcd. Do not upload any snapshot off the node, and do not rotate again. Fix the cause and repeat the procedure.
+
+### Required cross-repository follow-up (homelab-k3s)
+
+homelab-k3s `docs/secrets-encryption.md`, section "Key material and the off-node recovery copy", must be aligned with this helper before the Stage 3 live run. Open as of this change:
+- **Remove the source file's size from the metadata it says may be recorded.** This helper never records the plaintext or source size, only its mode, ownership and path checks, and the ciphertext's size and SHA-256.
+- **Replace `MATCH`/`MISMATCH` with `MATCH`, `DIFFER` or `ERROR`**, the results the helper reports.
+
 ## The filled inventory
 
 The filled inventory holds backup identifiers and version IDs, but no secret values. Its plaintext exists only in two places:
@@ -343,7 +498,8 @@ May be recorded:
 Never recorded:
 - plaintext, or any plaintext hash, size or prefix;
 - the private identity, the passphrase or a passphrase hint;
-- version IDs, which belong in the private inventory;
+- version IDs, which belong in the private inventory, and version receipts;
+- any part of the K3s secrets-encryption configuration, including key names;
 - the bucket name;
 - the account ID, ARNs, IAM Identity Center identifiers or the portal URL;
 - the off-site location or holder, drive letters or device serials.
@@ -368,9 +524,11 @@ Scan each evidence file before archiving it: `python3 scripts/validate-recovery-
 | --- | --- | --- |
 | Complete helper tests under Linux, with real `age` v1.3.2 | CI only (`scripts/test-recovery-material.sh`, group B is mandatory there) | Encrypt and verify round trips with a throwaway identity; `MATCH` and `DIFFER`; failed decryption; two-recipient refusal; no plaintext in any output; cleanup of the test directory |
 | Refusal paths and the S3 helper | CI and any Linux host with bash (groups A and C) | Guards, header checks, a TERM trap test, and the S3 helper against a stub `aws` command, including a zero-byte checksum case |
+| The `encryption-config` item | CI and any Linux host with bash (group D); its round trips need real `age` v1.3.2, which CI requires | A synthetic configuration with a random key. Covered: source checks (missing, symbolic link, directory, FIFO, device, empty, ownership simulated by a test-mode owner override, every group or other mode bit); path binding through the test-only expected-source override (the exact path accepted; an alternate file, relative and normalized aliases, a final-component or ancestor symbolic link, a differing canonical path by stub, a missing or non-directory credential directory, wrong directory ownership and a group- or other-writable directory refused); refusal of every test-only variable outside test mode and of test mode as root; the committed production path; `age` version refusals; invalid headers; `MATCH`, `DIFFER` and `ERROR`; cleanup after success, command failure, comparison failure and `TERM`, `HUP` and `INT`; receipt-based upload and exact-version download, including mismatched versions and receipts, and receipts, FIFOs and links planted during an upload; and that no key, key name, plaintext hash, bucket name or receipt-held version ID is printed |
 | Limited Windows probes | Run once by hand with `age.exe` v1.3.2 and a throwaway key | That real v1.3.2 X25519 ciphertext has exactly one stanza and passes the header check, and one encrypt/decrypt round trip. They do not run the Linux helpers |
 
 **Untested by any of them:**
+- a real `root:root` source and credential directory, and the production path itself: test mode cannot run as root, so ownership is checked against overrides, and the path through the test-only expected-source override. The tests never access `/var/lib/rancher/k3s/server/cred`;
 - production `sudo` and `runuser`;
 - the tmpfs mount;
 - the swap check;
