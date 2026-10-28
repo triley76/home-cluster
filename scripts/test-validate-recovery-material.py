@@ -28,6 +28,14 @@ FAKE_ACCOUNT = "4242" + "4242" + "4242"
 FAKE_ACCESS_KEY = "AK" + "IA" + "Q" * 16
 FAKE_SECRET_ASSIGNMENT = "aws_secret_" + "access_key = " + "Ab1/" * 10
 AGE_HEADER = "age-encryption.org" + "/v1\n-> X25519 x\ny\n--- z\n"
+# A synthetic 32-byte secretbox key in base64, as K3s writes it in encryption-config.json.
+FAKE_ENC_KEY = ("Qm9n" * 11)[:43] + "="
+FAKE_ENC_JSON = '{"secretbox":{"keys":[{"name":"k","sec' + 'ret":"' + FAKE_ENC_KEY + '"}]}}'
+FAKE_ENC_YAML = "sec" + "ret: " + FAKE_ENC_KEY
+ENC_ROW = "| K3s secrets-encryption configuration | Decryption comparison | `<YYYY-MM-DD, MATCH, DIFFER or ERROR>` |\n"
+TOKEN_ROW = "| K3s server token | Ciphertext SHA-256 | `<ciphertext SHA-256>` |\n"
+GRAFANA_ROW = "| Grafana admin credential | Last verification | `<YYYY-MM-DD, cmp -s result>` |\n"
+INVENTORY_ROW = "| Previous inventory object | `<recovery/recovery-inventory/YYYY-MM-DD.age, or none>` |\n"
 
 
 def scanned_files() -> list[str]:
@@ -115,6 +123,20 @@ CASES = {
     "recovery-extra-file": (write("recovery/notes.md", b"x\n"), "recovery-unexpected-file", "never-printed"),
     "template-filled-value": (replace(TEMPLATE, "`<YYYY-MM-DD>` |", "`2026-10-20` |"), "inventory-template-value", "2026-10-20"),
     "template-missing": (remove(TEMPLATE), "inventory-template-missing", "never-printed"),
+    "encryption-config-key-json": (append("docs/runbooks/encrypted-recovery-material.md", f"\n{FAKE_ENC_JSON}\n"), "encryption-config-key", FAKE_ENC_KEY),
+    "encryption-config-key-yaml": (append("README.md", f"\n    {FAKE_ENC_YAML}\n"), "encryption-config-key", FAKE_ENC_KEY),
+    "encryption-config-key-in-script": (append("scripts/validation-env.sh", f"\n# {FAKE_ENC_JSON}\n"), "encryption-config-key", FAKE_ENC_KEY),
+    "encryption-config-file-name": (write("docs/encryption-config.json", b"{}\n"), "secret-file-name", "never-printed"),
+    "encryption-config-backup-name": (write("backup/encryption-config-2026-10-27.json", b"{}\n"), "secret-file-name", "never-printed"),
+    "template-encryption-config-value": (replace(TEMPLATE, "`<ciphertext size in bytes>` |", "`512` |"), "inventory-template-value", "never-printed"),
+    "template-encryption-config-result": (replace(TEMPLATE, "`<YYYY-MM-DD, MATCH, DIFFER or ERROR>` |", "`2026-10-27, MATCH` |"), "inventory-template-value", "2026-10-27"),
+    "template-encryption-config-row-missing": (replace(TEMPLATE, ENC_ROW, ""), "inventory-template-row-missing", "never-printed"),
+    "template-token-row-missing": (replace(TEMPLATE, TOKEN_ROW, ""), "inventory-template-row-missing", "never-printed"),
+    "template-grafana-row-missing": (replace(TEMPLATE, GRAFANA_ROW, ""), "inventory-template-row-missing", "never-printed"),
+    "template-inventory-row-missing": (replace(TEMPLATE, INVENTORY_ROW, ""), "inventory-template-row-missing", "never-printed"),
+    "template-plaintext-hash-field": (append(TEMPLATE, "| K3s secrets-encryption configuration | Plaintext SHA-256 | `<hash>` |\n"), "inventory-template-forbidden-field", "never-printed"),
+    "template-key-name-field": (append(TEMPLATE, "| K3s secrets-encryption configuration | Key name | `<name>` |\n"), "inventory-template-forbidden-field", "never-printed"),
+    "template-plaintext-size-field": (append(TEMPLATE, "| K3s server token | Plain size | `<bytes>` |\n"), "inventory-template-forbidden-field", "never-printed"),
     "helper-tracing": (replace(HELPER, "set -euo pipefail\n", "set -euo pipefail\nset -x\n"), "helper-tracing", "never-printed"),
     "helper-debug-flag": (replace(HELPER, "  version=\"$(age --version", "  aws --debug >/dev/null\n  version=\"$(age --version"), "helper-debug-flag", "never-printed"),
     "helper-plaintext-digest": (replace(HELPER, "  rm -f -- \"${work}/plain\"\n\n", "  sha256sum -- \"${work}/plain\"\n  rm -f -- \"${work}/plain\"\n\n"), "helper-plaintext-digest", "never-printed"),
@@ -151,11 +173,29 @@ def main() -> None:
         assert named.returncode == 0, f"--scan applied file-name rules:\n{named.stderr}"
         missing = run(base, "--scan", str(Path(temp, "absent.txt")))
         assert missing.returncode == 1 and "not a file" in missing.stderr, "--scan accepted a missing file"
-        for value, rule in ((FAKE_SECRET_KEY, "age-secret-key"), (FAKE_ACCOUNT, "aws-account-id"), (FAKE_ACCESS_KEY, "aws-access-key-id")):
+        for value, rule in (
+            (FAKE_SECRET_KEY, "age-secret-key"),
+            (FAKE_ACCOUNT, "aws-account-id"),
+            (FAKE_ACCESS_KEY, "aws-access-key-id"),
+            (FAKE_ENC_JSON, "encryption-config-key"),
+            (f"| K3s secrets-encryption configuration | Source check | {FAKE_ENC_YAML} |", "encryption-config-key"),
+        ):
             evidence.write_text(f"line\n{value}\n", encoding="utf-8")
             dirty = run(base, "--scan", str(evidence))
             assert dirty.returncode == 1 and f":2: {rule}\n" in dirty.stderr, f"--scan missed {rule}"
             assert value not in dirty.stdout + dirty.stderr, f"--scan printed the {rule} value"
+            assert FAKE_ENC_KEY not in dirty.stdout + dirty.stderr, "--scan printed the encryption key"
+        # A filled encryption-configuration row with metadata only is accepted.
+        filled = Path(temp, "filled-inventory.md")
+        filled.write_text(
+            "| K3s secrets-encryption configuration | Object key | `recovery/encryption-config/2026-10-27.age` |\n"
+            "| K3s secrets-encryption configuration | Ciphertext SHA-256 | `" + "ab" * 32 + "` |\n"
+            "| K3s secrets-encryption configuration | Decryption comparison | `2026-10-27, MATCH` |\n"
+            "| K3s secrets-encryption configuration | Recovery-copy status | `verified` |\n",
+            encoding="utf-8",
+        )
+        ok = run(base, "--scan", str(filled))
+        assert ok.returncode == 0, f"metadata-only inventory rows rejected:\n{ok.stderr}"
 
     for name, (mutate, rule, value) in CASES.items():
         with tempfile.TemporaryDirectory() as temp:
@@ -189,7 +229,7 @@ def main() -> None:
     if failures:
         print("\n".join(failures), file=sys.stderr)
         sys.exit(1)
-    print(f"Recovery-material scanner mutation tests passed: {len(CASES)} cases, plus recipient, --scan and force-add checks")
+    print(f"Recovery-material scanner mutation tests passed: {len(CASES)} cases, plus recipient, --scan, filled-inventory and force-add checks")
 
 
 if __name__ == "__main__":

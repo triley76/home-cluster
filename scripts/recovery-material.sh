@@ -9,9 +9,14 @@
 #       path, size and SHA-256.
 #   verify --item ITEM --ciphertext FILE.age --source FILE --identity-archive FILE.age
 #       Decrypt a downloaded ciphertext into a private tmpfs and compare it with the
-#       source using cmp -s. Prints MATCH or DIFFER and the cmp exit status.
+#       source using cmp -s. Prints MATCH, DIFFER or ERROR and the cmp exit status.
 #
-# Items: k3s-server-token, grafana-admin, recovery-inventory.
+# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
+# encryption-config is the K3s secrets-encryption configuration (Stage 3). Its
+# --source must be exactly /var/lib/rancher/k3s/server/cred/encryption-config.json:
+# no other path, alias or symbolic-link component, with a canonical path equal to
+# it. The file must be owned by root:root, and its directory must be a real
+# directory owned by root:root and not writable by group or others.
 #
 # Production runs as root (through sudo). The helper never prints plaintext,
 # plaintext sizes or plaintext hashes; age reads the source file itself.
@@ -32,6 +37,14 @@
 #
 # Test mode (RECOVERY_MATERIAL_TEST=1, refused for root) replaces the recipient,
 # the identity and the tmpfs with paths supplied by scripts/test-recovery-material.sh.
+# For encryption-config it also replaces, from test-only variables:
+#   - the expected source path, with RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE (an
+#     absolute, normalized path);
+#   - the required root:root owner of the file and of its directory, with
+#     RECOVERY_MATERIAL_TEST_SOURCE_OWNER and RECOVERY_MATERIAL_TEST_PARENT_OWNER
+#     (uid:gid, default the test user's own).
+# These variables are refused outright outside test mode, so they can never
+# override a production source path or owner.
 # Test mode does NOT exercise sudo, runuser, the tmpfs mount, the swap check, the
 # passphrase prompt, SSH, AWS or S3.
 #
@@ -53,7 +66,12 @@ unset HISTFILE
 set +o history 2>/dev/null || true
 
 AGE_VERSION_REQUIRED="v1.3.2"
-ITEMS=(k3s-server-token grafana-admin recovery-inventory)
+ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config)
+# Items whose source must be owned by root:root (uid 0, gid 0).
+ROOT_OWNED_ITEMS=(encryption-config)
+# The only production source of encryption-config.
+ENCRYPTION_CONFIG_SOURCE="/var/lib/rancher/k3s/server/cred/encryption-config.json"
+TEST_ONLY_VARIABLES=(RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE RECOVERY_MATERIAL_TEST_SOURCE_OWNER RECOVERY_MATERIAL_TEST_PARENT_OWNER)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPIENT_FILE="$(cd "${script_dir}/.." && pwd)/recovery/home-cluster-recovery-recipient.txt"
 
@@ -67,6 +85,11 @@ if [[ "${RECOVERY_MATERIAL_TEST:-}" == "1" ]]; then
   [[ "$(id -u)" -ne 0 ]] || die "test mode must not run as root"
   test_mode=1
   RECIPIENT_FILE="${RECOVERY_MATERIAL_TEST_RECIPIENT:-$RECIPIENT_FILE}"
+fi
+if (( ! test_mode )); then
+  for name in "${TEST_ONLY_VARIABLES[@]}"; do
+    [[ -z "${!name+set}" ]] || die "${name} is test-only and is refused outside test mode"
+  done
 fi
 
 require_root() {
@@ -123,15 +146,97 @@ header_ok() {
   ' "$file"
 }
 
+root_owned_item() {
+  local known
+  for known in "${ROOT_OWNED_ITEMS[@]}"; do
+    [[ "$1" == "$known" ]] && return 0
+  done
+  return 1
+}
+
+required_owner() {
+  if (( test_mode )); then
+    printf '%s' "${RECOVERY_MATERIAL_TEST_SOURCE_OWNER:-$(id -u):$(id -g)}"
+  else
+    printf '0:0'
+  fi
+}
+
+required_parent_owner() {
+  if (( test_mode )); then
+    printf '%s' "${RECOVERY_MATERIAL_TEST_PARENT_OWNER:-$(id -u):$(id -g)}"
+  else
+    printf '0:0'
+  fi
+}
+
+expected_source() {
+  local expected="$ENCRYPTION_CONFIG_SOURCE"
+  if (( test_mode )) && [[ -n "${RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE:-}" ]]; then
+    expected="$RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE"
+    [[ "$expected" =~ ^(/[^/]+)+$ && "${expected}/" != */./* && "${expected}/" != */../* ]] \
+      || die "RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE must be an absolute, normalized path"
+  fi
+  printf '%s' "$expected"
+}
+
+# encryption-config only, before any other source check: the path must be exactly
+# the expected one, no component of its directory may be a symbolic link, and the
+# directory must be a root:root directory that group and others cannot write to.
+# Metadata only.
+check_bound_source() {
+  local src="$1" expected parent prefix="" part mode owner
+  local -a parts
+  expected="$(expected_source)"
+  [[ "$src" == "$expected" ]] || die "the encryption-config source must be exactly ${expected}"
+  parent="${expected%/*}"
+  IFS='/' read -r -a parts <<<"${parent#/}"
+  for part in "${parts[@]}"; do
+    prefix+="/${part}"
+    [[ ! -L "$prefix" ]] || die "a directory in the source path is a symbolic link: ${prefix}"
+  done
+  [[ -e "$parent" ]] || die "the credential directory does not exist: ${parent}"
+  [[ -d "$parent" ]] || die "the credential directory is not a directory: ${parent}"
+  read -r mode owner < <(stat -c '%a %u:%g' -- "$parent")
+  [[ "$owner" == "$(required_parent_owner)" ]] \
+    || die "the credential directory is not owned by root:root (owner ${owner}): ${parent}"
+  (( (8#${mode} & 8#022) == 0 )) \
+    || die "the credential directory is writable by group or others (mode ${mode}): ${parent}"
+}
+
+# After the file checks: the canonical path of the existing file is the expected path.
+check_canonical_source() {
+  local src="$1" resolved
+  resolved="$(realpath -e -- "$src")" || die "the source path could not be resolved: ${src}"
+  [[ "$resolved" == "$(expected_source)" ]] \
+    || die "the source path does not resolve to the expected path: ${src}"
+}
+
+# Metadata only (lstat and stat); the content is never read. Sets source_report, a
+# line that is safe to print.
 check_source() {
-  local src="$1" mode
-  [[ -e "$src" ]] || die "source does not exist: ${src}"
+  local item="$1" src="$2" mode owner
+  if [[ "$item" == "encryption-config" ]]; then
+    check_bound_source "$src"
+  fi
+  [[ -e "$src" || -L "$src" ]] || die "source does not exist: ${src}"
   [[ ! -L "$src" ]] || die "source is a symbolic link: ${src}"
   [[ -f "$src" ]] || die "source is not a regular file: ${src}"
   [[ -s "$src" ]] || die "source is empty: ${src}"
-  mode="$(stat -c '%a' -- "$src")"
+  read -r mode owner < <(stat -c '%a %u:%g' -- "$src")
   (( (8#${mode} & 8#077) == 0 )) \
     || die "source is accessible to group or others (mode ${mode}): ${src}"
+  source_report="PASS (regular file, nonempty, mode ${mode}, no group or other access"
+  if root_owned_item "$item"; then
+    [[ "$owner" == "$(required_owner)" ]] \
+      || die "source is not owned by root:root (owner ${owner}): ${src}"
+    source_report+=", owner root:root"
+  fi
+  if [[ "$item" == "encryption-config" ]]; then
+    check_canonical_source "$src"
+    source_report+=", expected path, directory root:root and not group or other writable"
+  fi
+  source_report+=")"
 }
 
 # The output directory must be a real directory owned by the operator (or root) and
@@ -200,7 +305,7 @@ cmd_encrypt() {
   check_out_dir "$(dirname -- "$out")"
   require_age
   recipient_ok "$RECIPIENT_FILE" || die "the committed recipient failed validation"
-  check_source "$src"
+  check_source "$item" "$src"
 
   local status=0
   age -R "$RECIPIENT_FILE" -- "$src" </dev/null | write_exclusive "$out" || status=$?
@@ -215,6 +320,7 @@ cmd_encrypt() {
   fi
 
   printf 'item: %s\n' "$item"
+  printf 'source check: %s\n' "$source_report"
   printf 'ciphertext: %s\n' "$out"
   printf 'ciphertext bytes: %s\n' "$(wc -c < "$out")"
   printf 'ciphertext sha256: %s\n' "$(ciphertext_sha256 "$out")"
@@ -286,7 +392,7 @@ cmd_verify() {
   require_age
   refuse_passphrase_env
   header_ok "$ciphertext" X25519 || die "the ciphertext header check failed"
-  check_source "$src"
+  check_source "$item" "$src"
 
   local identity
   if [[ -n "$archive" ]]; then
@@ -316,6 +422,8 @@ cmd_verify() {
 
   # The output is inside the private directory, which nothing else can write to.
   if ! age -d -i "$identity" -o "${work}/plain" -- "$ciphertext" </dev/null; then
+    printf 'item: %s\n' "$item"
+    printf 'result: ERROR\n'
     die "age decryption failed"
   fi
 
@@ -332,6 +440,7 @@ cmd_verify() {
   rm -f -- "${work}/plain"
 
   printf 'item: %s\n' "$item"
+  printf 'source check: %s\n' "$source_report"
   printf 'ciphertext sha256: %s\n' "$(ciphertext_sha256 "$ciphertext")"
   printf 'cmp -s exit status: %s\n' "$rc"
   printf 'result: %s\n' "$result"

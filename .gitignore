@@ -27,6 +27,9 @@ credentials/
 keys.txt
 *identity*.txt
 recovery-material-inventory.md
+# K3s secrets-encryption configurations and private S3 version receipts.
+encryption-config*.json
+*.receipt
 
 # Terraform local state and generated files
 .terraform/

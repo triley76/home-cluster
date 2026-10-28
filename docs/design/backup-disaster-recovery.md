@@ -397,7 +397,10 @@ Live sequence, at the level this design fixes:
    - all Flux Kustomizations are `Ready`.
 2. A homelab-k3s PR makes the server-configuration change that the documented procedure requires.
 3. The rehearsed procedure is executed exactly as recorded. It covers enabling, re-encrypting existing Secrets and one key rotation, so that the key that coexisted with plaintext data is retired. Any deviation from the recorded steps is a stop condition, not an improvisation.
-4. Copy the encryption-recovery material into recovery material as `age` ciphertext, if the rehearsal shows it is separately required. The rehearsal must still establish whether a restore with the matching token recovers it from bootstrap data alone.
+4. Copy the encryption configuration into recovery material as `age` ciphertext. The rehearsals did not establish that a restore with the matching token recovers it onto blank servers from bootstrap data alone, so the copy is required. The [Stage 2 runbook](../runbooks/encrypted-recovery-material.md#the-k3s-secrets-encryption-configuration-stage-3) defines the procedure and its timing:
+   - the copy is made after the second restart round, the enforced-enabled validation and the p2 snapshot;
+   - Stage 3 is complete only when the copy is uploaded, downloaded by exact version, compared byte for byte and verified by a controlled decryption comparison;
+   - no post-activation snapshot leaves the node before that.
 
 Validation:
 
@@ -496,7 +499,7 @@ Whether Flux and Helm adopt or replace the Velero-restored objects without losin
 | Item | Source | Changes when |
 | --- | --- | --- |
 | K3s server token | `/var/lib/rancher/k3s/server/token` (mode `0600`) | Token rotation |
-| K3s secrets-encryption recovery material, if Stage 3 shows it is separately required | The server's credential directory, after Stage 3 | Each key rotation |
+| K3s secrets-encryption configuration (item `encryption-config`) | `/var/lib/rancher/k3s/server/cred/encryption-config.json` (`root:root`, no group or other access), after Stage 3 | Each key rotation |
 | Grafana admin credential | The protected out-of-band credential file | Password change |
 | Velero repository password | Generated out of band in Stage 5 | Never, unless deliberately rotated |
 
@@ -540,7 +543,7 @@ The [blank template](../runbooks/recovery-material-inventory-template.md) is par
 | Item | Recorded in the inventory (never the secret itself) |
 | --- | --- |
 | K3s server token | Recovery object key; date of the last verification by `cmp -s` |
-| K3s secrets-encryption recovery material | Whether Stage 3 showed it to be separately required; if so, the object key and verification date |
+| K3s secrets-encryption configuration | Recovery object key and version ID; ciphertext SHA-256 and size; source check; exact-version download and decryption comparison results; the rotation and snapshot it follows; recovery-copy status. Never a key, key name, or plaintext hash or size |
 | Grafana admin credential | Recovery object key; verification date; the Secret name it recreates |
 | Velero/Kopia repository password | Recovery object key; verification date; the Secret name it recreates |
 | Storage map | Bucket name, region, and the prefix map (`etcd/`, `volumes/`, `recovery/`, `evidence/`) |

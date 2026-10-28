@@ -6,15 +6,26 @@
 # Subcommands:
 #   check-role
 #       Confirm the session is the HomeClusterBackupOperator role. Prints PASS or FAIL.
-#   upload --item ITEM --date YYYY-MM-DD --file FILE.age [--new-version]
+#   upload --item ITEM --date YYYY-MM-DD --file FILE.age [--new-version] [--receipt FILE]
 #       Upload to recovery/ITEM/DATE.age with an S3-verified SHA-256 checksum.
 #       Refuses to add a version to an existing key unless --new-version is given.
-#   download --item ITEM --date YYYY-MM-DD --version-id ID --out FILE.age --compare-with FILE.age
+#       With --receipt, the object key and version ID are written to a new private
+#       receipt file instead of being printed.
+#   download --item ITEM --date YYYY-MM-DD (--version-id ID | --receipt FILE)
+#            --out FILE.age --compare-with FILE.age
 #       Download that exact version into the helper's private work directory,
 #       validate it, copy it exclusively to --out, and compare it with the uploaded
-#       file using cmp -s.
+#       file using cmp -s. With --receipt, the version ID is read from the receipt,
+#       which must name the same object key, and is not printed.
 #
-# Items: k3s-server-token, grafana-admin, recovery-inventory.
+# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
+# encryption-config (the K3s secrets-encryption configuration) requires --receipt
+# for both upload and download, so its version ID is never printed.
+#
+# A receipt is a mode 600 file holding two lines, "key: <object key>" and
+# "version id: <version ID>", in a directory owned by the operator with no group
+# or other access (the inventory tmpfs). upload creates it exclusively, with a
+# hard link that never replaces, follows or opens an existing path.
 #
 # The bucket name comes from HOME_CLUSTER_BACKUP_BUCKET, or from the 0600 file
 # ~/.config/home-cluster/backup-bucket. It is never committed and never printed.
@@ -43,7 +54,9 @@ set +o history 2>/dev/null || true
 
 PROFILE="home-cluster-backup-operator"
 REGION="us-east-1"
-ITEMS=(k3s-server-token grafana-admin recovery-inventory)
+ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config)
+# Items whose version ID is kept in a receipt and never printed.
+RECEIPT_ITEMS=(encryption-config)
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -74,6 +87,59 @@ require_item() {
     [[ "$item" == "$known" ]] && return 0
   done
   die "unknown item: ${item} (expected one of: ${ITEMS[*]})"
+}
+
+receipt_item() {
+  local known
+  for known in "${RECEIPT_ITEMS[@]}"; do
+    [[ "$1" == "$known" ]] && return 0
+  done
+  return 1
+}
+
+# The receipt directory must be a real directory owned by the operator, with no
+# group or other access.
+check_receipt_dir() {
+  local dir="$1" owner mode
+  [[ -d "$dir" && ! -L "$dir" ]] || die "the receipt directory does not exist or is a symbolic link"
+  read -r owner mode < <(stat -c '%u %a' -- "$dir")
+  [[ "$owner" == "$(id -u)" ]] || die "the receipt directory is not owned by the operator"
+  (( (8#${mode} & 8#077) == 0 )) || die "the receipt directory is accessible to group or others (mode ${mode})"
+}
+
+# Reads the version ID from a receipt for the current key. Neither value is printed.
+read_receipt() {
+  local file="$1" mode owner line1 line2
+  [[ -f "$file" && ! -L "$file" ]] || die "the receipt is missing, not a regular file, or a symbolic link"
+  check_receipt_dir "$(dirname -- "$file")"
+  read -r mode owner < <(stat -c '%a %u' -- "$file")
+  [[ "$owner" == "$(id -u)" ]] || die "the receipt is not owned by the operator"
+  [[ "$mode" == "600" || "$mode" == "400" ]] || die "the receipt must be mode 600 or 400"
+  [[ "$(wc -l < "$file")" -eq 2 ]] || die "the receipt is malformed"
+  { IFS= read -r line1 && IFS= read -r line2; } <"$file" || die "the receipt is malformed"
+  # Exactly those two LF-terminated lines, with nothing after them.
+  [[ "$(wc -c < "$file")" -eq $(( ${#line1} + ${#line2} + 2 )) ]] || die "the receipt is malformed"
+  [[ "$line1" == "key: ${key}" ]] || die "the receipt is for a different object key"
+  [[ "$line2" == "version id: "* ]] || die "the receipt is malformed"
+  version_id="${line2#version id: }"
+  line2=""
+  version_ok "$version_id" || die "the receipt holds no usable version ID"
+}
+
+# Creates the receipt exclusively: the content goes to a new private file from
+# mktemp (O_EXCL, mode 600) in the same directory, which is then hard-linked to the
+# receipt name. link(2) fails if the name exists in any form (file, symbolic link,
+# FIFO or device) and never follows or opens it, unlike a noclobber redirection,
+# which opens an existing non-regular file. The temporary name is always removed.
+write_receipt() {
+  local file="$1" version="$2" staged status=0
+  staged="$(mktemp -- "$(dirname -- "$file")/.receipt.XXXXXX")" || return 1
+  printf 'key: %s\nversion id: %s\n' "$key" "$version" >"$staged" || status=1
+  if (( status == 0 )); then
+    ln -- "$staged" "$file" 2>/dev/null || status=1
+  fi
+  rm -f -- "$staged" || status=1
+  return "$status"
 }
 
 load_bucket() {
@@ -206,7 +272,7 @@ object_exists() {
 }
 
 parse_args() {
-  item="" date="" file="" version_id="" out="" compare="" new_version=0
+  item="" date="" file="" version_id="" out="" compare="" receipt="" new_version=0
   while (( $# )); do
     if [[ "$1" == "--new-version" ]]; then
       new_version=1
@@ -221,6 +287,7 @@ parse_args() {
       --version-id) version_id="$2" ;;
       --out) out="$2" ;;
       --compare-with) compare="$2" ;;
+      --receipt) receipt="$2" ;;
       *) die "unknown argument: $1" ;;
     esac
     shift 2
@@ -232,6 +299,13 @@ cmd_upload() {
   [[ -n "$item" && -n "$date" && -n "$file" ]] || die "upload needs --item, --date and --file"
   require_item "$item"
   object_key
+  if receipt_item "$item"; then
+    [[ -n "$receipt" ]] || die "${item} upload needs --receipt, so its version ID is not printed"
+  fi
+  if [[ -n "$receipt" ]]; then
+    [[ ! -e "$receipt" && ! -L "$receipt" ]] || die "the receipt already exists: ${receipt}"
+    check_receipt_dir "$(dirname -- "$receipt")"
+  fi
   header_ok "$file" || die "the file is not a single-recipient X25519 age ciphertext"
   load_bucket
   require_role
@@ -248,16 +322,34 @@ cmd_upload() {
   version_ok "$version" || die "S3 returned no usable version ID; versioning may not be enabled"
 
   printf 'key: %s\n' "$key"
-  printf 'version id: %s\n' "$version"
+  if [[ -n "$receipt" ]]; then
+    if ! write_receipt "$receipt" "$version"; then
+      version=""
+      die "the upload succeeded but the receipt could not be written; treat the new version as unverified and do not use it"
+    fi
+    version=""
+    printf 'version receipt: %s\n' "$receipt"
+  else
+    printf 'version id: %s\n' "$version"
+  fi
+  printf 'ciphertext bytes: %s\n' "$(wc -c < "$file")"
   printf 'ciphertext sha256: %s\n' "$(sha256_hex "$file")"
 }
 
 cmd_download() {
   parse_args "$@"
-  [[ -n "$item" && -n "$date" && -n "$version_id" && -n "$out" && -n "$compare" ]] \
-    || die "download needs --item, --date, --version-id, --out and --compare-with"
+  [[ -n "$item" && -n "$date" && -n "$out" && -n "$compare" ]] \
+    || die "download needs --item, --date, --version-id or --receipt, --out and --compare-with"
+  [[ -n "$version_id" && -z "$receipt" || -z "$version_id" && -n "$receipt" ]] \
+    || die "download needs exactly one of --version-id and --receipt"
   require_item "$item"
   object_key
+  if receipt_item "$item"; then
+    [[ -n "$receipt" ]] || die "${item} download needs --receipt, so its version ID is not printed"
+  fi
+  if [[ -n "$receipt" ]]; then
+    read_receipt "$receipt"
+  fi
   version_ok "$version_id" || die "--version-id has unexpected characters"
   [[ ! -e "$out" && ! -L "$out" ]] || die "output already exists: ${out}"
   header_ok "$compare" || die "--compare-with is not a single-recipient X25519 age ciphertext"
@@ -285,7 +377,11 @@ cmd_download() {
   esac
 
   printf 'key: %s\n' "$key"
-  printf 'version id: %s\n' "$version_id"
+  if [[ -n "$receipt" ]]; then
+    printf 'version id: as recorded in the receipt\n'
+  else
+    printf 'version id: %s\n' "$version_id"
+  fi
   printf 'downloaded sha256: %s\n' "$(sha256_hex "$out")"
   printf 'uploaded sha256: %s\n' "$(sha256_hex "$compare")"
   printf 'cmp -s exit status: %s\n' "$rc"
