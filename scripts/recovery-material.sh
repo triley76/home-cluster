@@ -10,6 +10,16 @@
 #   verify --item ITEM --ciphertext FILE.age --source FILE --identity-archive FILE.age
 #       Decrypt a downloaded ciphertext into a private tmpfs and compare it with the
 #       source using cmp -s. Prints MATCH, DIFFER or ERROR and the cmp exit status.
+#   start-run --dir DIR
+#       Create DIR (mode 0700, which must not exist) as this run's directory, with a
+#       run marker. Every file a run creates or transports on this host goes in it.
+#   cleanup --dir DIR [--remove NAME]... [--keep FILE]...
+#       Remove exactly the named run files, then the marker and DIR, and confirm that
+#       each kept file (a ciphertext retained from an earlier run, outside DIR) is
+#       unchanged. Before removing anything it refuses: a DIR without the marker; a
+#       name other than ITEM.age, ITEM.downloaded.age or identity-archive.age; a
+#       missing, linked, foreign or pre-run file; and any entry not named. Never
+#       needs root, and refuses it.
 #
 # Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
 # encryption-config is the K3s secrets-encryption configuration (Stage 3). Its
@@ -71,6 +81,8 @@ ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config)
 ROOT_OWNED_ITEMS=(encryption-config)
 # The only production source of encryption-config.
 ENCRYPTION_CONFIG_SOURCE="/var/lib/rancher/k3s/server/cred/encryption-config.json"
+# Created by start-run in each run directory; cleanup refuses a directory without it.
+RUN_MARKER=".recovery-run"
 TEST_ONLY_VARIABLES=(RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE RECOVERY_MATERIAL_TEST_SOURCE_OWNER RECOVERY_MATERIAL_TEST_PARENT_OWNER)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPIENT_FILE="$(cd "${script_dir}/.." && pwd)/recovery/home-cluster-recovery-recipient.txt"
@@ -447,6 +459,141 @@ cmd_verify() {
   [[ "$rc" -eq 0 ]]
 }
 
+# start-run and cleanup act on the operator's own files and never need root.
+refuse_root() {
+  [[ "$(id -u)" -ne 0 ]] || die "run this subcommand as yourself, not as root or through sudo"
+}
+
+# An absolute path with no empty, "." or ".." component and no trailing slash.
+normalized_path() {
+  [[ "$1" =~ ^(/[^/]+)+$ && "${1}/" != */./* && "${1}/" != */../* ]]
+}
+
+# The only names a run creates or transports: ITEM.age, ITEM.downloaded.age and
+# the transported identity-archive.age.
+run_file_name_ok() {
+  local name="$1" known
+  [[ "$name" == "identity-archive.age" ]] && return 0
+  for known in "${ITEMS[@]}"; do
+    [[ "$name" == "${known}.age" || "$name" == "${known}.downloaded.age" ]] && return 0
+  done
+  return 1
+}
+
+# Device and inode, link count, size, modification time and ciphertext SHA-256 of a
+# kept file, compared before and after a cleanup. Never printed.
+keep_fingerprint() {
+  printf '%s %s' "$(stat -c '%d:%i %h %s %y' -- "$1")" "$(ciphertext_sha256 "$1")"
+}
+
+cmd_start_run() {
+  local dir="" parent
+  while (( $# )); do
+    [[ "$1" == --* && $# -ge 2 ]] || die "missing value for argument: $1"
+    case "$1" in
+      --dir) dir="$2" ;;
+      *) die "unknown argument: $1" ;;
+    esac
+    shift 2
+  done
+  [[ -n "$dir" ]] || die "start-run needs --dir"
+  refuse_root
+  normalized_path "$dir" || die "the run directory must be an absolute, normalized path: ${dir}"
+  [[ ! -e "$dir" && ! -L "$dir" ]] || die "the run directory already exists: ${dir}"
+  parent="${dir%/*}"
+  [[ -d "$parent" && ! -L "$parent" ]] || die "the parent directory does not exist or is a symbolic link: ${parent}"
+  [[ "$(realpath -e -- "$parent")" == "$parent" ]] || die "the parent directory path contains a symbolic link: ${parent}"
+  # mkdir without -p fails if the name exists in any form, including one created since the check.
+  mkdir -m 0700 -- "$dir" || die "could not create the run directory: ${dir}"
+  (set -C; : >"${dir}/${RUN_MARKER}") || die "could not create the run marker in ${dir}"
+  printf 'run directory: %s\n' "$dir"
+  printf 'result: PASS\n'
+}
+
+# Removes the named run files, the marker and the run directory, and nothing else.
+# Every check runs before the first removal, so a refusal removes nothing.
+cmd_cleanup() {
+  local dir="" marker name entry path mode owner failed=0 i
+  local -a remove=() keep=() fingerprints=()
+  local -A listed=()
+  while (( $# )); do
+    [[ "$1" == --* && $# -ge 2 ]] || die "missing value for argument: $1"
+    case "$1" in
+      --dir) dir="$2" ;;
+      --remove) remove+=("$2") ;;
+      --keep) keep+=("$2") ;;
+      *) die "unknown argument: $1" ;;
+    esac
+    shift 2
+  done
+  [[ -n "$dir" ]] || die "cleanup needs --dir"
+  refuse_root
+  normalized_path "$dir" || die "the run directory must be an absolute, normalized path: ${dir}"
+  [[ -d "$dir" && ! -L "$dir" ]] || die "the run directory does not exist or is a symbolic link: ${dir}"
+  [[ "$(realpath -e -- "$dir")" == "$dir" ]] || die "the run directory path contains a symbolic link: ${dir}"
+  read -r mode owner < <(stat -c '%a %u' -- "$dir")
+  [[ "$mode $owner" == "700 $(id -u)" ]] || die "the run directory must be mode 700 and owned by you: ${dir}"
+  marker="${dir}/${RUN_MARKER}"
+  [[ -f "$marker" && ! -L "$marker" ]] || die "not a run directory (no ${RUN_MARKER} from start-run): ${dir}"
+  [[ "$(stat -c '%u %h' -- "$marker")" == "$(id -u) 1" ]] || die "the run marker is not yours or has other links: ${marker}"
+
+  for name in "${remove[@]}"; do
+    run_file_name_ok "$name" || die "not a run file name (ITEM.age, ITEM.downloaded.age or identity-archive.age): ${name}"
+    [[ -z "${listed[$name]:-}" ]] || die "run file listed more than once: ${name}"
+    listed[$name]=1
+    path="${dir}/${name}"
+    [[ ! -L "$path" ]] || die "run file is a symbolic link: ${path}"
+    [[ -f "$path" ]] || die "run file does not exist or is not a regular file: ${path}"
+    [[ "$(stat -c '%u %h' -- "$path")" == "$(id -u) 1" ]] || die "run file is not yours or has other hard links: ${path}"
+    [[ ! "$path" -ot "$marker" ]] || die "run file predates the run directory, so this run did not create it: ${path}"
+  done
+
+  for path in "${keep[@]}"; do
+    normalized_path "$path" || die "a kept file must be an absolute, normalized path: ${path}"
+    [[ "$path" != "${dir}/"* ]] || die "a kept file must not be inside the run directory: ${path}"
+    [[ -f "$path" && ! -L "$path" ]] || die "kept file does not exist, is not a regular file, or is a symbolic link: ${path}"
+    [[ "$(realpath -e -- "$path")" == "$path" ]] || die "the kept file path contains a symbolic link: ${path}"
+    fingerprints+=("$(keep_fingerprint "$path")")
+  done
+
+  # The directory must hold exactly the marker and the listed run files.
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "$RUN_MARKER" || -n "${listed[$entry]:-}" ]] || die "unexpected entry in the run directory; nothing was removed: ${dir}/${entry}"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\0')
+
+  for name in "${remove[@]}"; do
+    path="${dir}/${name}"
+    if rm -f -- "$path" && [[ ! -e "$path" && ! -L "$path" ]]; then
+      printf 'removed: %s\n' "$path"
+    else
+      printf 'ERROR: could not remove %s\n' "$path" >&2
+      failed=1
+    fi
+  done
+  if (( ! failed )) && ! { rm -f -- "$marker" && rmdir -- "$dir"; }; then
+    failed=1
+  fi
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    printf 'ERROR: the run directory is still present: %s\n' "$dir" >&2
+    failed=1
+  else
+    printf 'run directory: absent\n'
+  fi
+  for i in "${!keep[@]}"; do
+    if [[ -f "${keep[$i]}" && ! -L "${keep[$i]}" && "$(keep_fingerprint "${keep[$i]}")" == "${fingerprints[$i]}" ]]; then
+      printf 'retained unchanged: %s\n' "${keep[$i]}"
+    else
+      printf 'ERROR: a kept file is missing or changed: %s\n' "${keep[$i]}" >&2
+      failed=1
+    fi
+  done
+  if (( failed )); then
+    printf 'result: ERROR\n'
+    return 1
+  fi
+  printf 'result: PASS\n'
+}
+
 main() {
   local command="${1:-}"
   (( $# )) && shift
@@ -454,7 +601,9 @@ main() {
     check-recipient) cmd_check_recipient ;;
     encrypt) cmd_encrypt "$@" ;;
     verify) cmd_verify "$@" ;;
-    *) die "usage: recovery-material.sh {check-recipient|encrypt|verify} [options]" ;;
+    start-run) cmd_start_run "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    *) die "usage: recovery-material.sh {check-recipient|encrypt|verify|start-run|cleanup} [options]" ;;
   esac
 }
 

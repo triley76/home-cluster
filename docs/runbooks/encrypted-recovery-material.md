@@ -106,8 +106,11 @@ It does not record how the bucket name was configured (item 6), or whether the s
 
    ```bash
    git archive --format=tar <reviewed-commit> scripts/recovery-material.sh recovery/ \
-     | ssh k3s01 'install -d -m 0700 ~/hc-recovery ~/hc-recovery/out && tar -x -C ~/hc-recovery'
+     | ssh k3s01 'test ! -e ~/hc-recovery && install -d -m 0700 ~/hc-recovery && tar -x -C ~/hc-recovery \
+         && bash ~/hc-recovery/scripts/recovery-material.sh start-run --dir ~/hc-recovery/out'
    ```
+
+   `~/hc-recovery` must not exist on `k3s01` beforehand: a copy left by an earlier run stops this step. `start-run` creates `out` as this run's directory ([Run directories](#run-directories-and-scoped-cleanup)) and must print `result: PASS`.
 
 ## Session hygiene
 
@@ -127,6 +130,30 @@ Never do any of the following:
 - open the filled inventory in a Windows editor, VS Code, or any editor that keeps swap, backup or undo files on disk.
 
 The helpers refuse to run with tracing enabled, or with any `AGE_*` or `*PASSPHRASE*` variable set.
+
+## Run directories and scoped cleanup
+
+Every file that a run creates or transports goes into a run directory made for that run by `start-run`, and only `cleanup` removes it. Never remove these files with a wildcard or a recursive delete. Ciphertexts kept from earlier runs, such as the Stage 2 copies directly under `~/hc-recovery` on the workstation, have the same names as the files a new run creates.
+
+- **On `k3s01`**: `~/hc-recovery/out`, created by prerequisite 7.
+- **On the workstation**: a new directory for each run, created before the first copy, in the shell that holds `$inv`:
+
+  ```bash
+  install -d -m 0700 ~/hc-recovery
+  run=~/hc-recovery/run-<YYYY-MM-DD>
+  bash scripts/recovery-material.sh start-run --dir "$run"
+  ```
+
+  It must print `result: PASS`. It refuses a directory that already exists, so a second run on the same day needs a new name, such as `run-<YYYY-MM-DD>-2`. In a new shell, set `run` again; do not run `start-run` again.
+
+`start-run` creates the directory with mode `700` and an empty run marker. `cleanup` takes the files to remove by name (`--remove`), and every ciphertext kept from an earlier run by absolute path (`--keep`). Before it removes anything, it refuses, and then removes nothing, if it finds:
+- a directory without the run marker, or one that is a symbolic link, lies under a symbolic-link path, is not mode `700` or is not yours;
+- a name other than `<item>.age`, `<item>.downloaded.age` or `identity-archive.age`, including any wildcard or path;
+- a named file that is missing, is not a regular file, is a symbolic link, has another hard link, is not yours, or is older than the run marker, so that this run did not create it;
+- any entry in the directory that is not named, including a retained ciphertext copied into it;
+- a kept file that is missing, is a symbolic link or lies inside the run directory.
+
+It then removes the named files, the marker and the directory. It confirms that the directory is absent and that each kept file still has the same inode, link count, size, modification time and SHA-256. It prints each removed and retained path, then `result: PASS`; otherwise `result: ERROR`, with a non-zero exit. It refuses to run as root, and it never prints a hash.
 
 ## Preflight (metadata only)
 
@@ -163,7 +190,7 @@ bash scripts/recovery-material-s3.sh check-role
 
 Repeat for `k3s-server-token`, then `grafana-admin`. Use one date, `<YYYY-MM-DD>`, for the whole run.
 
-**Before step 1**, create and verify the inventory tmpfs on the workstation and copy the template into it ([The filled inventory](#the-filled-inventory), steps 1 and 2). Identifiers from this procedure are typed straight into it and are written nowhere else.
+**Before step 1**, create and verify the inventory tmpfs on the workstation and copy the template into it ([The filled inventory](#the-filled-inventory), steps 1 and 2). Then create the workstation run directory, `$run` ([Run directories](#run-directories-and-scoped-cleanup)). Identifiers from this procedure are typed straight into the inventory and are written nowhere else.
 
 1. **Encrypt on the source host.** `age` reads the source itself. The output is created exclusively, as you, never overwriting an existing path.
 
@@ -176,15 +203,14 @@ Repeat for `k3s-server-token`, then `grafana-admin`. Use one date, `<YYYY-MM-DD>
 2. **Copy the ciphertext to the workstation** (ciphertext only):
 
    ```bash
-   install -d -m 0700 ~/hc-recovery
-   scp k3s01:hc-recovery/out/k3s-server-token.age ~/hc-recovery/k3s-server-token.age
+   scp k3s01:hc-recovery/out/k3s-server-token.age "$run/k3s-server-token.age"
    ```
 
 3. **Upload with the routine role:**
 
    ```bash
    bash scripts/recovery-material-s3.sh upload --item k3s-server-token --date <YYYY-MM-DD> \
-     --file ~/hc-recovery/k3s-server-token.age
+     --file "$run/k3s-server-token.age"
    ```
 
    S3 checks the SHA-256 checksum on receipt. Record the version ID for the private inventory only, never in Git.
@@ -192,15 +218,15 @@ Repeat for `k3s-server-token`, then `grafana-admin`. Use one date, `<YYYY-MM-DD>
 
    ```bash
    bash scripts/recovery-material-s3.sh download --item k3s-server-token --date <YYYY-MM-DD> \
-     --version-id <version-id> --out ~/hc-recovery/k3s-server-token.downloaded.age \
-     --compare-with ~/hc-recovery/k3s-server-token.age
+     --version-id <version-id> --out "$run/k3s-server-token.downloaded.age" \
+     --compare-with "$run/k3s-server-token.age"
    ```
 
    It must print `result: MATCH`.
 5. **Copy the downloaded ciphertext to the source host.** The first time only, also copy the identity archive from its OneDrive location:
 
    ```bash
-   scp ~/hc-recovery/k3s-server-token.downloaded.age k3s01:hc-recovery/out/
+   scp "$run/k3s-server-token.downloaded.age" k3s01:hc-recovery/out/
    scp <identity-archive> k3s01:hc-recovery/out/identity-archive.age   # first item only
    ```
 
@@ -229,13 +255,24 @@ Repeat for `k3s-server-token`, then `grafana-admin`. Use one date, `<YYYY-MM-DD>
 **Run this on `k3s01` as soon as both items are verified there**, before moving on to the inventory, not at the end of the whole session:
 
 ```bash
-rm -f -- ~/hc-recovery/out/identity-archive.age ~/hc-recovery/out/*.age
-test ! -e ~/hc-recovery/out/identity-archive.age && echo "identity archive: absent"
-find ~/hc-recovery/out -maxdepth 1 -type f -name '*.age' | wc -l      # must print 0
+bash ~/hc-recovery/scripts/recovery-material.sh cleanup --dir ~/hc-recovery/out \
+  --remove k3s-server-token.age --remove k3s-server-token.downloaded.age \
+  --remove grafana-admin.age --remove grafana-admin.downloaded.age \
+  --remove identity-archive.age
 findmnt -t tmpfs -S recovery-material                                 # must print nothing
 ```
 
-These checks use file names and mount tables only; they never read file contents. Then remove the helper copy (`rm -rf -- ~/hc-recovery`) and confirm with `test ! -e ~/hc-recovery && echo "helper copy: absent"`.
+Name exactly the files this run put in `out`. For the `encryption-config` item, they are `encryption-config.age`, `encryption-config.downloaded.age` and `identity-archive.age`. After a stop part-way through, name only those that exist. `cleanup` must print `removed:` for each of them, `run directory: absent` and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)). Nothing on `k3s01` is kept, so no `--keep` is given. These checks use metadata and mount tables only; they never read file contents.
+
+Then remove the helper copy, by name, and confirm that nothing else was in it:
+
+```bash
+rm -f -- ~/hc-recovery/scripts/recovery-material.sh ~/hc-recovery/recovery/home-cluster-recovery-recipient.txt
+rmdir -- ~/hc-recovery/scripts ~/hc-recovery/recovery ~/hc-recovery
+test ! -e ~/hc-recovery && echo "helper copy: absent"
+```
+
+`rmdir` fails on a directory that still holds anything. If it does, stop and find out why, rather than removing the rest.
 
 ## The K3s secrets-encryption configuration (Stage 3)
 
@@ -298,7 +335,7 @@ The helpers print metadata only:
 
 ### Procedure
 
-The prerequisites, session hygiene and per-host cleanup are those of the token and Grafana procedure above. Create and verify the inventory tmpfs first ([The filled inventory](#the-filled-inventory), step 1); `$inv` below is that tmpfs.
+The prerequisites, session hygiene and per-host cleanup are those of the token and Grafana procedure above. Create and verify the inventory tmpfs first ([The filled inventory](#the-filled-inventory), step 1), then the workstation run directory ([Run directories](#run-directories-and-scoped-cleanup)). `$inv` below is that tmpfs, and `$run` is the run directory.
 
 1. **Preflight on `k3s01`**, metadata only:
 
@@ -326,7 +363,7 @@ The prerequisites, session hygiene and per-host cleanup are those of the token a
 3. **Copy the ciphertext to the workstation**, ciphertext only:
 
    ```bash
-   scp k3s01:hc-recovery/out/encryption-config.age ~/hc-recovery/encryption-config.age
+   scp k3s01:hc-recovery/out/encryption-config.age "$run/encryption-config.age"
    ```
 
    Check that its SHA-256 equals the value printed in step 2.
@@ -334,7 +371,7 @@ The prerequisites, session hygiene and per-host cleanup are those of the token a
 
    ```bash
    bash scripts/recovery-material-s3.sh upload --item encryption-config --date <YYYY-MM-DD> \
-     --file ~/hc-recovery/encryption-config.age --receipt "$inv/encryption-config.receipt"
+     --file "$run/encryption-config.age" --receipt "$inv/encryption-config.receipt"
    ```
 
    It prints the object key, the receipt path, and the ciphertext size and SHA-256. It refuses to run without `--receipt`, or if the receipt exists, is a link, or sits in a directory with group or other access.
@@ -342,8 +379,8 @@ The prerequisites, session hygiene and per-host cleanup are those of the token a
 
    ```bash
    bash scripts/recovery-material-s3.sh download --item encryption-config --date <YYYY-MM-DD> \
-     --receipt "$inv/encryption-config.receipt" --out ~/hc-recovery/encryption-config.downloaded.age \
-     --compare-with ~/hc-recovery/encryption-config.age
+     --receipt "$inv/encryption-config.receipt" --out "$run/encryption-config.downloaded.age" \
+     --compare-with "$run/encryption-config.age"
    ```
 
    It must print `result: MATCH`. S3 must return the exact version in the receipt, or the download is refused and nothing is written to `--out`.
@@ -373,7 +410,7 @@ The prerequisites, session hygiene and per-host cleanup are those of the token a
    - the cleanup result;
    - the rotation and p2 snapshot it follows;
    - `Recovery-copy status: verified`.
-8. **Run the [per-host cleanup](#per-host-cleanup) on `k3s01`**, then re-encrypt, upload and verify the changed inventory ([The filled inventory](#the-filled-inventory), steps 3 to 5). Its cleanup removes the receipt with the tmpfs.
+8. **Run the [per-host cleanup](#per-host-cleanup) on `k3s01`**, then re-encrypt, upload and verify the changed inventory ([The filled inventory](#the-filled-inventory), steps 3 to 5). Its cleanup removes the receipt with the tmpfs. Then make the [offline copies](#offline-copies-on-recovery-a-and-b), and only after both are verified, the workstation run cleanup.
 
 ### Stop conditions for this item
 
@@ -425,31 +462,29 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
 
    ```bash
    sudo bash scripts/recovery-material.sh encrypt --item recovery-inventory \
-     --source "$inv/recovery-material-inventory.md" --out ~/hc-recovery/recovery-inventory.age
+     --source "$inv/recovery-material-inventory.md" --out "$run/recovery-inventory.age"
    bash scripts/recovery-material-s3.sh upload --item recovery-inventory --date <YYYY-MM-DD> \
-     --file ~/hc-recovery/recovery-inventory.age
+     --file "$run/recovery-inventory.age"
    bash scripts/recovery-material-s3.sh download --item recovery-inventory --date <YYYY-MM-DD> \
-     --version-id <version-id> --out ~/hc-recovery/recovery-inventory.downloaded.age \
-     --compare-with ~/hc-recovery/recovery-inventory.age
+     --version-id <version-id> --out "$run/recovery-inventory.downloaded.age" \
+     --compare-with "$run/recovery-inventory.age"
    sudo bash scripts/recovery-material.sh verify --item recovery-inventory \
-     --ciphertext ~/hc-recovery/recovery-inventory.downloaded.age \
+     --ciphertext "$run/recovery-inventory.downloaded.age" \
      --source "$inv/recovery-material-inventory.md" --identity-archive <identity-archive>
    ```
 
    On the workstation, `--identity-archive` points at the archive in its OneDrive location. `verify` copies it into its own tmpfs, removes that copy on exit, and does not create a transported copy on the WSL disk.
-4. **Copy the verified ciphertext to Recovery A, then to Recovery B**, as in [Offline copies](#offline-copies-on-recovery-a-and-b). If an offline plaintext copy is also required, copy `recovery-material-inventory.md` from the tmpfs straight to the recovery media in the same way. Never stage it through any other location.
-5. **Clean up and check:**
+4. **Copy the exact-version downloaded ciphertext (`recovery-inventory.downloaded.age`, verified in step 3) to Recovery A, then to Recovery B**, as in [Offline copies](#offline-copies-on-recovery-a-and-b). If an offline plaintext copy is also required, copy `recovery-material-inventory.md` from the tmpfs straight to the recovery media in the same way. Never stage it through any other location.
+5. **Clean up the inventory tmpfs and check:**
 
    ```bash
    rm -f -- "$inv/recovery-material-inventory.md"
    sudo umount "$inv" && sudo rmdir "$inv"
    findmnt --mountpoint "$inv"                     # must print nothing
    test ! -e "$inv" && echo "inventory tmpfs: removed"
-   rm -f -- ~/hc-recovery/*.age
-   find ~/hc-recovery -maxdepth 1 -type f -name '*.age' | wc -l    # must print 0
    ```
 
-   Then stop the WSL keep-alive.
+   Then stop the WSL keep-alive. **Leave `$run` as it is.** Its cleanup waits until both offline copies are verified; see [Workstation run cleanup](#workstation-run-cleanup-after-both-offline-copies).
 
 ## Offline copies on Recovery A and B
 
@@ -458,10 +493,10 @@ Only one recovery device is connected at a time. Copy and check sequentially, fr
 For each device in turn (Recovery A first; Recovery B when it is next available):
 
 1. Connect only that device and unlock it at the BitLocker prompt. Note its drive letter for this session only; never record it.
-2. Copy the verified ciphertext and check it against the SHA-256 recorded by `encrypt`:
+2. Copy the exact-version downloaded ciphertext and check it against the SHA-256 recorded by `encrypt`. The download comparison reported `MATCH`, so the two are byte-identical:
 
    ```powershell
-   $src = '\\wsl.localhost\Ubuntu\home\<user>\hc-recovery\recovery-inventory.age'
+   $src = '\\wsl.localhost\Ubuntu\home\<user>\hc-recovery\run-<YYYY-MM-DD>\recovery-inventory.downloaded.age'
    $dst = '<drive>:\home-cluster\recovery-inventory-<YYYY-MM-DD>.age'
    Copy-Item -LiteralPath $src -Destination $dst
    (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash -eq '<recorded ciphertext sha256>'   # must print True
@@ -469,7 +504,28 @@ For each device in turn (Recovery A first; Recovery B when it is next available)
 
 3. Lock the device (`manage-bde -lock <drive>:`), eject it, and disconnect it before connecting the other.
 
-If Recovery B is not available during the run, its copy stays pending. Record only "Recovery B: pending" or "Recovery B: verified", with the date, in the evidence. Never record a drive letter, physical location, device serial or holder.
+If a device is not available during the run, usually Recovery B, its copy stays pending. Record only "Recovery A: pending" or "Recovery A: verified", and likewise for Recovery B, with the date, in the evidence. Never record a drive letter, physical location, device serial or holder.
+
+### Workstation run cleanup (after both offline copies)
+
+**Do not run the workstation run cleanup until Recovery A and Recovery B have both verified the exact-version downloaded inventory ciphertext.** For each device, step 2 must have printed `True` for its copy of `recovery-inventory.downloaded.age`, and the device must then have been locked and ejected.
+
+**If either device is pending or unavailable, keep the entire run directory**, with both inventory ciphertexts, exactly as it is:
+- do not run `cleanup` on it, and do not remove any file from it, even one unrelated to the pending copy;
+- do not move or copy its inventory ciphertext into `~/hc-recovery`, beside the retained Stage 2 ciphertexts, or anywhere else on the workstation;
+- record the device as pending. When it is next available, set `run` to the same directory in a new shell, without running `start-run`. Copy and check as in steps 1 to 3 above, and only then run this cleanup. The inventory tmpfs and the keep-alive are not needed for this.
+
+Once both devices are verified:
+
+```bash
+bash scripts/recovery-material.sh cleanup --dir "$run" \
+  --remove k3s-server-token.age --remove k3s-server-token.downloaded.age \
+  --remove grafana-admin.age --remove grafana-admin.downloaded.age \
+  --remove recovery-inventory.age --remove recovery-inventory.downloaded.age \
+  --keep ~/hc-recovery/<retained ciphertext>
+```
+
+Name with `--remove` exactly the files this run put in `$run`. For the `encryption-config` run, they are `encryption-config.age`, `encryption-config.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. Name with `--keep`, one per option, every ciphertext kept from an earlier run, such as each Stage 2 copy directly under `~/hc-recovery`. `cleanup` must print `run directory: absent`, `retained unchanged:` for each kept file, and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)).
 
 ## Stop conditions
 
@@ -480,6 +536,8 @@ Stop the run, record the outcome only, and do not improvise if:
 - `check-role` prints `FAIL`;
 - `AccessDenied` on a designed action. Do not widen permissions, and do not switch to `AdministratorAccess`;
 - the inventory tmpfs checks differ from their expected output;
+- `start-run` or `cleanup` refuses, or `cleanup` prints `result: ERROR`. Remove nothing by hand, and never fall back to a wildcard or a recursive delete;
+- an offline copy is pending or unverified when the workstation run cleanup is due. This stop is mandatory: do not run the cleanup, and keep the entire run directory until Recovery A and Recovery B have both verified the exact-version downloaded inventory ciphertext ([Workstation run cleanup](#workstation-run-cleanup-after-both-offline-copies));
 - any secret-shaped value appears in a terminal, log, evidence file or Git. Treat it as compromised and follow [SECURITY.md](../../SECURITY.md): rotate the token or password, then re-encrypt.
 
 ## Partial failure
@@ -490,7 +548,7 @@ Stop the run, record the outcome only, and do not improvise if:
   - upload again with `--new-version` and a new receipt, and repeat the comparisons; or
   - with separate approval, rebuild the receipt from read-only S3 metadata, as on 2026-10-29. The listing must hold exactly one version and no delete marker for the exact key, the latest version, the recorded ciphertext size, and a `ChecksumSHA256` equal to the recorded ciphertext SHA-256. Write the receipt in the helper's two-line format, exclusively, mode 600, without printing the version ID. Prove it with `download --receipt … --compare-with` against the original ciphertext, which must report `result: MATCH`, and record the reconstruction as a deviation.
 - **Verification interrupted:** `verify` removes its tmpfs files and unmounts its tmpfs, keeps the original failure status, and reports any cleanup failure. Confirm that `findmnt -t tmpfs -S recovery-material` prints nothing before retrying.
-- **Stopped part-way through:** run the per-host cleanup on every host already used, and the inventory cleanup if its tmpfs exists, before anything else.
+- **Stopped part-way through:** run the per-host cleanup on every host already used, and the inventory cleanup if its tmpfs exists, before anything else. Name with `--remove` only the run files that exist. The workstation run cleanup still waits until both offline copies are verified.
 
 ## Rollback
 
@@ -539,6 +597,7 @@ Scan each evidence file before archiving it: `python3 scripts/validate-recovery-
 | Complete helper tests under Linux, with real `age` v1.3.2 | CI only (`scripts/test-recovery-material.sh`, group B is mandatory there) | Encrypt and verify round trips with a throwaway identity; `MATCH` and `DIFFER`; failed decryption; two-recipient refusal; no plaintext in any output; cleanup of the test directory |
 | Refusal paths and the S3 helper | CI and any Linux host with bash (groups A and C) | Guards, header checks, a TERM trap test, and the S3 helper against a stub `aws` command, including a zero-byte checksum case |
 | The `encryption-config` item | CI and any Linux host with bash (group D); its round trips need real `age` v1.3.2, which CI requires | A synthetic configuration with a random key. Covered: source checks (missing, symbolic link, directory, FIFO, device, empty, ownership simulated by a test-mode owner override, every group or other mode bit); path binding through the test-only expected-source override (the exact path accepted; an alternate file, relative and normalized aliases, a final-component or ancestor symbolic link, a differing canonical path by stub, a missing or non-directory credential directory, wrong directory ownership and a group- or other-writable directory refused); refusal of every test-only variable outside test mode and of test mode as root; the committed production path; `age` version refusals; invalid headers; `MATCH`, `DIFFER` and `ERROR`; cleanup after success, command failure, comparison failure and `TERM`, `HUP` and `INT`; receipt-based upload and exact-version download, including mismatched versions and receipts, and receipts, FIFOs and links planted during an upload; and that no key, key name, plaintext hash, bucket name or receipt-held version ID is printed |
+| Run directories and scoped cleanup | CI and any Linux host with bash (group E), as in production, with no test mode | `start-run` (mode `700` and marker; an existing directory, a relative path and a symbolic-link parent refused); `cleanup` removing only the named run files and the directory while each retained ciphertext beside it stays byte-identical; refusal, with nothing removed, of a retained ciphertext copied into the run directory (named or not), a `..` name, a wildcard or unrelated name, the retained directory itself, a duplicate or missing name, symbolic and hard links to a retained ciphertext, a symbolic-link directory, path, marker or kept file, a kept file inside the run directory, an unexpected subdirectory and a directory that is not mode `700`; and mutants with the timestamp, exact-contents, name or marker guard disabled, each caught |
 | Limited Windows probes | Run once by hand with `age.exe` v1.3.2 and a throwaway key | That real v1.3.2 X25519 ciphertext has exactly one stanza and passes the header check, and one encrypt/decrypt round trip. They do not run the Linux helpers |
 
 **Untested by any of them:**
