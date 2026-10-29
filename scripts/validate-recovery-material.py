@@ -21,7 +21,12 @@ and checks that:
   - the runbook instructs the workstation run cleanup only after both offline
     copies (Recovery A and B) of the exact-version downloaded inventory ciphertext
     are verified, keeps the whole run directory while either is pending, and makes
-    that a mandatory stop condition.
+    that a mandatory stop condition;
+  - the runbook's inventory update decrypts the previous inventory only through the
+    helper, into the inventory tmpfs, behind the keep-alive, swap and tmpfs gates;
+    never displays or edits plaintext unsafely; validates the replacement and
+    removes the previous plaintext before encrypting; and only reads, and finally
+    keeps, the previous inventory ciphertext.
 
 A finding is reported as path, line number and rule name only. Matched text is
 never printed, so a failing run cannot leak the value it found.
@@ -31,6 +36,11 @@ never printed, so a failing run cannot leak the value it found.
   validate-recovery-material.py --scan FILE...   (content rules only, for evidence
                                                  files and a filled inventory outside
                                                  Git; no repository files are needed)
+  validate-recovery-material.py --check-inventory FILE [--previous-key KEY]
+                               (a decrypted or replacement inventory in its tmpfs: a
+                               regular file, the content rules, every required row and,
+                               with --previous-key, a filled replacement whose previous
+                               inventory object is exactly KEY; prints PASS or findings)
 
 Tracked and staged files are always scanned, so a secret-named file that was
 force-added past .gitignore is still reported.
@@ -95,6 +105,32 @@ STOP_SECTION = "## Stop conditions"
 OFFLINE_STOP = "an offline copy is pending or unverified when the workstation run cleanup is due. This stop is mandatory"
 # The offline copies are made from the exact-version downloaded inventory ciphertext.
 OFFLINE_SOURCE = "\\hc-recovery\\run-<YYYY-MM-DD>\\recovery-inventory.downloaded.age'"
+# Updating an existing inventory: the previous inventory is decrypted only by the
+# helper, into the inventory tmpfs, after the keep-alive, swap and tmpfs gates. The
+# replacement is validated, and the previous plaintext removed, before encryption
+# (step 3). The previous inventory ciphertext ("$prior") is only read, then kept.
+INVENTORY_SECTION = "## The filled inventory"
+UPDATE_SECTION = "### Updating an existing inventory"
+UPDATE_GATES = ("pgrep -fx 'sleep 14400'", "swapon --show", 'findmnt -no FSTYPE --mountpoint "$inv"')
+DECRYPT_COMMAND = "recovery-material.sh decrypt-inventory"
+DECRYPT_DIR = '--inventory-dir "$inv"'
+UPDATE_VALIDATE = 'validate-recovery-material.py --check-inventory "$inv/recovery-material-inventory.md"'
+UPDATE_PREVIOUS_KEY = "--previous-key recovery/recovery-inventory/"
+UPDATE_REMOVE = 'rm -f -- "$inv/previous-inventory.md"'
+UPDATE_CONFIRM = 'test ! -e "$inv/previous-inventory.md"'
+UPDATE_CONTINUE = "**Only then continue with step 3**"
+PRIOR = '"$prior"'
+PRIOR_USES = ('--ciphertext "$prior"', '--keep "$prior"')
+PLAINTEXT_FILE = r"(?:previous-inventory|recovery-material-inventory)\.md"
+RAW_DECRYPT = re.compile(r"\bage\b[^\n#]*\s(?:-d|--decrypt)\b")
+PLAINTEXT_OUTPUT = re.compile(
+    r"\b(?:cat|less|more|head|tail|bat|xxd|od|strings|tee|grep|sed|awk|nano|emacs|gedit|code|notepad(?:\.exe)?)\b"
+    r"[^\n#]*" + PLAINTEXT_FILE
+)
+EDITOR = re.compile(r"\bvim?\b[^\n#]*" + PLAINTEXT_FILE)
+SAFE_EDITOR = ("vim -n -i NONE", "set nobackup nowritebackup noundofile")
+PREVIOUS_KEY_RE = re.compile(r"recovery/recovery-inventory/[0-9]{4}-[0-9]{2}-[0-9]{2}\.age")
+PREVIOUS_ROW = ("", "Previous inventory object")
 
 SECRET_NAMES = {"keys.txt", "token", "credentials", "kubeconfig", "recovery-material-inventory.md"}
 SECRET_SUFFIXES = {".age", ".pem", ".key", ".p12", ".pfx", ".kubeconfig"}
@@ -223,7 +259,86 @@ def offline_gate_findings(text: str) -> list[tuple[str, int, str]]:
     sources = [line.strip() for line in lines[offline[0]:offline[1]] if line.strip().startswith("$src")]
     if not sources or any(not line.endswith(OFFLINE_SOURCE) for line in sources):
         found.append((RUNBOOK, 0, "runbook-offline-source"))
+    if not any('--keep "$prior"' in lines[i] for i in range(*gate)):
+        found.append((RUNBOOK, 0, "runbook-update-prior-unprotected"))
     return found
+
+
+def line_of(lines: list[str], span: tuple[int, int], text: str) -> int | None:
+    return next((i for i in range(*span) if text in lines[i]), None)
+
+
+def update_findings(text: str) -> list[tuple[str, int, str]]:
+    lines = text.splitlines()
+    found = []
+    parent = section_span(lines, INVENTORY_SECTION) or (len(lines), len(lines))
+    update = section_span(lines, UPDATE_SECTION)
+    if update is None or not (parent[0] < update[0] and update[1] <= parent[1]):
+        found.append((RUNBOOK, 0, "runbook-update-missing"))
+        update = update or (len(lines), len(lines))
+    decrypt = line_of(lines, update, DECRYPT_COMMAND)
+    if decrypt is None or any(line_of(lines, (update[0], decrypt), gate) is None for gate in UPDATE_GATES):
+        found.append((RUNBOOK, 0, "runbook-update-gates-missing"))
+    for index, line in enumerate(lines):
+        number = index + 1
+        if DECRYPT_COMMAND in line and not (update[0] < index < update[1] and DECRYPT_DIR in line):
+            found.append((RUNBOOK, number, "runbook-decrypt-outside-tmpfs"))
+        if RAW_DECRYPT.search(line):
+            found.append((RUNBOOK, number, "runbook-decrypt-outside-tmpfs"))
+        if PLAINTEXT_OUTPUT.search(line):
+            found.append((RUNBOOK, number, "runbook-plaintext-output"))
+        if EDITOR.search(line) and not all(flag in line for flag in SAFE_EDITOR):
+            found.append((RUNBOOK, number, "runbook-unsafe-editor"))
+        if PRIOR in line and not line.lstrip().startswith("prior=") and not any(use in line for use in PRIOR_USES):
+            found.append((RUNBOOK, number, "runbook-update-prior-unprotected"))
+    validate = line_of(lines, update, UPDATE_VALIDATE)
+    previous_key = line_of(lines, update, UPDATE_PREVIOUS_KEY)
+    remove = line_of(lines, update, UPDATE_REMOVE)
+    confirm = line_of(lines, update, UPDATE_CONFIRM)
+    resume = line_of(lines, update, UPDATE_CONTINUE)
+    if validate is None or previous_key is None or decrypt is None or not decrypt < validate:
+        found.append((RUNBOOK, 0, "runbook-update-validation-missing"))
+    if None in (remove, confirm, resume) or not (validate or 0) < remove < confirm < resume:
+        found.append((RUNBOOK, 0, "runbook-update-previous-not-removed"))
+    return found
+
+
+def table_cells(line: str) -> list[str]:
+    """The cells of a Markdown table data row; empty for headers, separators and other lines."""
+    if not line.lstrip().startswith("|"):
+        return []
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    if len(cells) < 2 or all(set(cell) <= set("-: ") for cell in cells) or cells[-1] == "Value":
+        return []
+    return cells
+
+
+def check_inventory(path: Path, previous_key: str | None) -> list[tuple[str, int, str]]:
+    """Checks a decrypted or replacement inventory without printing any of its values."""
+    name = str(path)
+    if path.is_symlink() or not path.is_file():
+        return [(name, 0, "inventory-not-regular-file")]
+    raw: list[tuple[str, int, str]] = []
+    scan_file(path.parent, path.name, raw, names=False)
+    findings = [(name, line, rule) for _, line, rule in raw]
+    rows: dict[tuple[str, str], tuple[int, str]] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        cells = table_cells(line)
+        if not cells:
+            continue
+        rows.setdefault((cells[0] if len(cells) > 2 else "", cells[-2]), (number, cells[-1]))
+        if previous_key is not None and PLACEHOLDER.fullmatch(cells[-1]):
+            findings.append((name, number, "inventory-placeholder-left"))
+    for row in REQUIRED_ROWS:
+        if row not in rows:
+            findings.append((name, 0, "inventory-row-missing"))
+    if previous_key is not None:
+        number, value = rows.get(PREVIOUS_ROW, (0, ""))
+        if not PREVIOUS_KEY_RE.fullmatch(previous_key):
+            findings.append((name, 0, "inventory-previous-key-format"))
+        elif value.strip("`") != previous_key:
+            findings.append((name, number, "inventory-previous-key-mismatch"))
+    return sorted(set(findings))
 
 
 def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
@@ -247,6 +362,7 @@ def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
         if runbook.count(SCOPED_CLEANUP) < SCOPED_CLEANUP_MIN:
             findings.append((RUNBOOK, 0, "runbook-scoped-cleanup-missing"))
         findings.extend(offline_gate_findings(runbook))
+        findings.extend(update_findings(runbook))
 
     if TEMPLATE not in files:
         findings.append((TEMPLATE, 0, "inventory-template-missing"))
@@ -254,8 +370,8 @@ def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
         rows = 0
         seen = set()
         for number, line in enumerate((root / TEMPLATE).read_text(encoding="utf-8").splitlines(), 1):
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")] if line.lstrip().startswith("|") else []
-            if len(cells) < 2 or all(set(cell) <= set("-: ") for cell in cells) or cells[-1] == "Value":
+            cells = table_cells(line)
+            if not cells:
                 continue
             rows += 1
             seen.add((cells[0] if len(cells) > 2 else "", cells[-2]))
@@ -277,7 +393,22 @@ def main() -> int:
     parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--check-recipient", metavar="PATH")
     parser.add_argument("--scan", nargs="+", metavar="FILE")
+    parser.add_argument("--check-inventory", metavar="FILE")
+    parser.add_argument("--previous-key", metavar="KEY")
     args = parser.parse_args()
+
+    if args.previous_key is not None and not args.check_inventory:
+        print("ERROR: --previous-key needs --check-inventory", file=sys.stderr)
+        return 1
+    if args.check_inventory:
+        findings = check_inventory(Path(args.check_inventory), args.previous_key)
+        for path, line, rule in findings:
+            print(f"{path}:{line}: {rule}", file=sys.stderr)
+        if findings:
+            print(f"ERROR: {len(findings)} inventory finding(s); values are not shown", file=sys.stderr)
+            return 1
+        print("PASS")
+        return 0
 
     if args.scan:
         findings = []

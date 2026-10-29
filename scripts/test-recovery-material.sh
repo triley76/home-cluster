@@ -13,6 +13,11 @@
 #          retained prior ciphertext beside or copied into a run directory is never
 #          removed, every refusal removes nothing, and mutants with a guard disabled
 #          are caught.
+# Group F: decrypt-inventory for an inventory update: decryption into the inventory
+#          directory only (real age, as in group B), every refusal before decryption,
+#          removal of the plaintext after a failure or TERM, the encrypt guard against
+#          a leftover previous plaintext, an unchanged previous ciphertext, the tmpfs
+#          gate outside test mode, and mutants with a guard disabled.
 #
 # Every run uses RECOVERY_MATERIAL_TEST=1 overrides or stubs. These tests do NOT
 # exercise production sudo or runuser, the tmpfs mount, the swap check, the /dev/tty
@@ -1213,6 +1218,252 @@ if [[ -L "${e_links}/k3s-server-token.age" && -f "${e_links}/recovery-inventory.
   pass "cleanup: links and retained ciphertexts untouched after the link refusals"
 else
   fail "cleanup links" "a link or retained ciphertext was removed or changed"
+fi
+
+# --- group F: decrypt-inventory (updating an existing inventory) ------------------------
+echo "Group F: decrypt-inventory (inventory update)"
+template="${repo_root}/docs/runbooks/recovery-material-inventory-template.md"
+f_src="$(fresh_dir)"   # holds the previous inventory ciphertext and the archive, outside the tmpfs
+# A header-only stand-in for the passphrase-encrypted archive: test mode decrypts with the
+# throwaway test identity instead, because it cannot answer a passphrase prompt.
+write_header "${f_src}/archive.age" scrypt
+archive_sum="$(sha256sum -- "${f_src}/archive.age" | cut -d' ' -f1)"
+
+# The inventory-encryption guard needs no decryption.
+f_guard="$(fresh_dir)"
+install -m 0600 -- "$template" "${f_guard}/recovery-material-inventory.md"
+for leftover in previous-inventory.md previous-inventory.age identity-archive.age; do
+  : >"${f_guard}/${leftover}"
+  expect "decrypt-inventory: encrypt refuses the inventory beside ${leftover}" 1 "remove ${leftover} from the inventory directory" -- \
+    run_test_mode bash "$helper" encrypt --item recovery-inventory --source "${f_guard}/recovery-material-inventory.md" \
+    --out "${tmp}/f-guard-${leftover}.age"
+  rm -f -- "${f_guard}/${leftover}"
+  if [[ ! -e "${tmp}/f-guard-${leftover}.age" ]]; then
+    pass "decrypt-inventory: no ciphertext written beside ${leftover}"
+  else
+    fail "encrypt guard" "ciphertext written beside ${leftover}"
+  fi
+done
+
+if (( real_age_ok )); then
+  f_key="$(fresh_dir)"
+  age-keygen -o "${f_key}/identity" 2>/dev/null
+  age-keygen -y "${f_key}/identity" >"${f_key}/recipient"
+  age-keygen -o "${f_key}/other-identity" 2>/dev/null
+  # The previous inventory: the template plus a sentinel row that must never be printed.
+  { cat -- "$template"; printf '\n| Note | %s |\n' "\`${sentinel}\`"; } >"${f_key}/previous.md"
+  age -R "${f_key}/recipient" -o "${f_src}/previous.age" -- "${f_key}/previous.md"
+  prior="${f_src}/previous.age"
+  prior_sum="$(sha256sum -- "$prior" | cut -d' ' -f1)"
+  prior_state="$(stat -c '%i %s %y' -- "$prior") ${prior_sum}"
+  prior_unchanged() {
+    [[ "$(stat -c '%i %s %y' -- "$prior" 2>/dev/null) $(sha256sum -- "$prior" 2>/dev/null | cut -d' ' -f1)" == "$prior_state" ]]
+  }
+  # dec HELPER INVENTORY-DIR [ARG...]: decrypt-inventory in test mode; later arguments
+  # override the defaults. The archive SHA-256 is given in upper case, as the runbook shows it.
+  dec() {
+    local helper_path="$1" dir="$2"
+    shift 2
+    env RECOVERY_MATERIAL_TEST=1 RECOVERY_MATERIAL_TEST_RECIPIENT="${f_key}/recipient" \
+      RECOVERY_MATERIAL_TEST_IDENTITY="${F_IDENTITY:-${f_key}/identity}" \
+      bash "$helper_path" decrypt-inventory --inventory-dir "$dir" --ciphertext "$prior" --ciphertext-sha256 "$prior_sum" \
+      --identity-archive "${f_src}/archive.age" --archive-sha256 "${archive_sum^^}" "$@"
+  }
+  inventory_encrypt() {
+    env RECOVERY_MATERIAL_TEST=1 RECOVERY_MATERIAL_TEST_RECIPIENT="${f_key}/recipient" bash "$1" encrypt \
+      --item recovery-inventory --source "$2" --out "$3"
+  }
+
+  f_inv="$(fresh_dir)"
+  expect "decrypt-inventory: decrypts the previous inventory into the inventory directory" ok "result: PASS" -- \
+    dec "$helper" "$f_inv"
+  if [[ -f "${f_inv}/previous-inventory.md" && ! -L "${f_inv}/previous-inventory.md" \
+    && "$(stat -c '%a %h' -- "${f_inv}/previous-inventory.md")" == "600 1" ]] \
+    && cmp -s -- "${f_inv}/previous-inventory.md" "${f_key}/previous.md" \
+    && [[ "$(ls -A -- "$f_inv")" == "previous-inventory.md" ]]; then
+    pass "decrypt-inventory: mode 600, byte-identical, and only the plaintext is left (copies removed)"
+  else
+    fail "decrypt-inventory" "plaintext missing, wrong mode or content, or a copy left behind"
+  fi
+  if prior_unchanged; then pass "decrypt-inventory: the previous inventory ciphertext is unchanged"; else fail "decrypt-inventory" "prior changed"; fi
+  expect "decrypt-inventory: refuses an existing previous plaintext" 1 "already present in the inventory directory" -- \
+    dec "$helper" "$f_inv"
+  if cmp -s -- "${f_inv}/previous-inventory.md" "${f_key}/previous.md"; then
+    pass "decrypt-inventory: the existing previous plaintext is not replaced"
+  else
+    fail "decrypt-inventory" "existing previous plaintext was changed"
+  fi
+
+  # The update flow: replacement, removal of the previous plaintext, then encryption.
+  install -m 0600 -- "${f_inv}/previous-inventory.md" "${f_inv}/recovery-material-inventory.md"
+  expect "decrypt-inventory: encrypt refuses while the previous plaintext remains" 1 "remove previous-inventory.md" -- \
+    inventory_encrypt "$helper" "${f_inv}/recovery-material-inventory.md" "${tmp}/f-new.age"
+  rm -f -- "${f_inv}/previous-inventory.md"
+  expect "decrypt-inventory: encrypt succeeds once the previous plaintext is removed" ok "ciphertext sha256: " -- \
+    inventory_encrypt "$helper" "${f_inv}/recovery-material-inventory.md" "${tmp}/f-new.age"
+  expect "decrypt-inventory: encrypt never overwrites the previous inventory ciphertext" 1 "output already exists" -- \
+    inventory_encrypt "$helper" "${f_inv}/recovery-material-inventory.md" "$prior"
+  if prior_unchanged; then pass "decrypt-inventory: previous ciphertext unchanged after the update flow"; else fail "update flow" "prior changed"; fi
+
+  # Refusals before decryption. Each must leave the inventory directory empty.
+  f_refuse() {
+    local name="$1" message="$2" dir
+    shift 2
+    dir="$(fresh_dir)"
+    expect "decrypt-inventory: refuses ${name}" 1 "$message" -- dec "$helper" "$dir" "$@"
+    if empty_dir "$dir" && prior_unchanged; then
+      pass "decrypt-inventory: nothing left after refusing ${name}"
+    else
+      fail "decrypt-inventory: ${name}" "files left in the inventory directory, or the previous ciphertext changed"
+    fi
+  }
+  f_refuse "a wrong ciphertext SHA-256" "previous inventory ciphertext does not have the expected SHA-256" \
+    --ciphertext-sha256 "$archive_sum"
+  f_refuse "a wrong archive SHA-256" "identity archive does not have the expected SHA-256" --archive-sha256 "$prior_sum"
+  f_refuse "a malformed SHA-256" "64 hexadecimal characters" --ciphertext-sha256 abc123
+  write_header "${f_src}/not-scrypt.age" X25519
+  f_refuse "an archive that is not passphrase-encrypted" "not a passphrase-encrypted age file" \
+    --identity-archive "${f_src}/not-scrypt.age" --archive-sha256 "$(sha256sum -- "${f_src}/not-scrypt.age" | cut -d' ' -f1)"
+  write_header "${f_src}/two-stanzas.age" X25519 X25519
+  f_refuse "a ciphertext with two stanzas" "previous inventory ciphertext header check failed" \
+    --ciphertext "${f_src}/two-stanzas.age" --ciphertext-sha256 "$(sha256sum -- "${f_src}/two-stanzas.age" | cut -d' ' -f1)"
+  ln -s "$prior" "${f_src}/prior-link.age"
+  f_refuse "a symbolic-link ciphertext" "ciphertext is a symbolic link" --ciphertext "${f_src}/prior-link.age"
+  ln -s "$f_src" "${tmp}/src-link"
+  f_refuse "a ciphertext under a symbolic-link path" "path contains a symbolic link" --ciphertext "${tmp}/src-link/previous.age"
+  f_refuse "a relative ciphertext path" "must be absolute and normalized" --ciphertext previous.age
+  f_refuse "a missing archive" "identity archive does not exist" --identity-archive "${f_src}/absent.age"
+  f_refuse "an unknown argument" "unknown argument" --out "${tmp}/elsewhere.md"
+  f_in="$(fresh_dir)"
+  cp -- "$prior" "${f_in}/previous-copy.age"
+  expect "decrypt-inventory: refuses a ciphertext inside the inventory directory" 1 "must not be inside the inventory directory" -- \
+    dec "$helper" "$f_in" --ciphertext "${f_in}/previous-copy.age"
+  f_mode="$(fresh_dir)"
+  chmod 0750 "$f_mode"
+  expect "decrypt-inventory: refuses an inventory directory that is not mode 700" 1 "must be mode 700 and owned by you" -- \
+    dec "$helper" "$f_mode"
+  ln -s "$(fresh_dir)" "${tmp}/inv-link"
+  expect "decrypt-inventory: refuses a symbolic-link inventory directory" 1 "does not exist or is a symbolic link" -- \
+    dec "$helper" "${tmp}/inv-link"
+  f_rep="$(fresh_dir)"
+  install -m 0600 -- "$template" "${f_rep}/recovery-material-inventory.md"
+  expect "decrypt-inventory: refuses an existing replacement" 1 "already present in the inventory directory" -- \
+    dec "$helper" "$f_rep"
+
+  # Outside test mode, the inventory directory must be a tmpfs mount point.
+  not_tmpfs() {
+    env -u RECOVERY_MATERIAL_TEST -u RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE bash "$1" decrypt-inventory \
+      --inventory-dir "$2" --ciphertext "$prior" --ciphertext-sha256 "$prior_sum" \
+      --identity-archive "${f_src}/archive.age" --archive-sha256 "$archive_sum" </dev/null
+  }
+  f_prod="$(fresh_dir)"
+  expect "decrypt-inventory: refuses an inventory directory that is not a tmpfs (production mode)" 1 "not a tmpfs mount point" -- \
+    not_tmpfs "$helper" "$f_prod"
+  if empty_dir "$f_prod"; then pass "decrypt-inventory: nothing written to a directory that is not a tmpfs"; else fail "production tmpfs gate" "files written"; fi
+
+  # Failures after decryption starts. Each must remove the plaintext and the copies.
+  grep -v '| Decryption comparison |' -- "${f_key}/previous.md" >"${f_key}/missing-row.md"
+  age -R "${f_key}/recipient" -o "${f_src}/missing-row.age" -- "${f_key}/missing-row.md"
+  : >"${f_key}/empty.md"
+  age -R "${f_key}/recipient" -o "${f_src}/empty.age" -- "${f_key}/empty.md"
+  dec_file() {
+    dec "$1" "$2" --ciphertext "${f_src}/$3" --ciphertext-sha256 "$(sha256sum -- "${f_src}/$3" | cut -d' ' -f1)"
+  }
+  dec_other_identity() { F_IDENTITY="${f_key}/other-identity" dec "$1" "$2"; }
+  dec_missing_row() { dec_file "$1" "$2" missing-row.age; }
+  dec_empty() { dec_file "$1" "$2" empty.age; }
+  f_after() {
+    local name="$1" message="$2" runner="$3" dir
+    dir="$(fresh_dir)"
+    expect "decrypt-inventory: ${name}" 1 "$message" -- "$runner" "$helper" "$dir"
+    if empty_dir "$dir"; then pass "decrypt-inventory: no plaintext or copy left after: ${name}"; else fail "decrypt-inventory: ${name}" "files left behind"; fi
+  }
+  f_after "fails with the wrong identity" "age decryption failed" dec_other_identity
+  f_after "refuses a previous inventory that fails the inventory check" "failed the inventory check" dec_missing_row
+  f_after "refuses an empty previous inventory" "missing, empty or not a regular file" dec_empty
+
+  # Mutation tests: each scenario holds for the real helper and fails with its guard disabled.
+  scenario_wrong_sum() {
+    local dir
+    dir="$(fresh_dir)"
+    dec "$1" "$dir" --ciphertext-sha256 "$archive_sum" >"${tmp}/scenario" 2>&1 && return 1
+    grep -qF "does not have the expected SHA-256" "${tmp}/scenario" && empty_dir "$dir"
+  }
+  scenario_failed_check() {
+    local dir
+    dir="$(fresh_dir)"
+    dec_missing_row "$1" "$dir" >"${tmp}/scenario" 2>&1 && return 1
+    grep -qF "failed the inventory check" "${tmp}/scenario" && empty_dir "$dir"
+  }
+  scenario_not_tmpfs() {
+    local dir
+    dir="$(fresh_dir)"
+    not_tmpfs "$1" "$dir" >"${tmp}/scenario" 2>&1 && return 1
+    grep -qF "not a tmpfs mount point" "${tmp}/scenario" && empty_dir "$dir"
+  }
+  scenario_encrypt_beside_previous() {
+    local dir
+    dir="$(fresh_dir)"
+    install -m 0600 -- "$template" "${dir}/recovery-material-inventory.md"
+    : >"${dir}/previous-inventory.md"
+    inventory_encrypt "$1" "${dir}/recovery-material-inventory.md" "${dir}/new.age" >"${tmp}/scenario" 2>&1 && return 1
+    [[ ! -e "${dir}/new.age" ]]
+  }
+  f_mutant="${mutant_dir}/recovery-material.sh"
+  # decrypt-inventory runs the inventory check from the helper's own directory.
+  cp -- "${repo_root}/scripts/validate-recovery-material.py" "${mutant_dir}/"
+  f_mutant_case() {
+    local label="$1" expression="$2" scenario="$3"
+    sed "$expression" "$helper" >"$f_mutant"
+    if cmp -s -- "$helper" "$f_mutant"; then
+      fail "decrypt-inventory mutant: ${label}" "mutation anchor not found"
+    elif ! "$scenario" "$helper"; then
+      fail "decrypt-inventory mutant: ${label}" "the scenario fails against the real helper"
+    elif "$scenario" "$f_mutant"; then
+      fail "decrypt-inventory mutant: ${label}" "the scenario passed with the guard disabled"
+    else
+      pass "decrypt-inventory mutant: ${label}: killed by ${scenario#scenario_}"
+    fi
+  }
+  f_mutant_case "no ciphertext SHA-256 guard" 's/|| die "the previous inventory ciphertext does not have/|| : "/' scenario_wrong_sum
+  f_mutant_case "plaintext kept after a failed check" 's/if (( ! decrypt_done )); then/if false; then/' scenario_failed_check
+  f_mutant_case "no tmpfs guard" 's/|| die "the inventory directory is not a tmpfs mount point/|| : "/' scenario_not_tmpfs
+  f_mutant_case "no encrypt guard for the previous plaintext" \
+    's/|| die "remove \(.*\) from the inventory directory before encrypting/|| : "\1/' scenario_encrypt_beside_previous
+  if prior_unchanged; then pass "decrypt-inventory: previous ciphertext unchanged after every case and mutant"; else fail "decrypt-inventory" "prior changed"; fi
+elif [[ "${RECOVERY_MATERIAL_REQUIRE_AGE:-}" == "1" ]]; then
+  fail "group F" "age and age-keygen v1.3.2 are required (RECOVERY_MATERIAL_REQUIRE_AGE=1)"
+else
+  skipped=$((skipped + 1))
+  echo "skip group F decryption cases: age and age-keygen v1.3.2 are not on PATH"
+fi
+
+# TERM during decryption, with the stub age, which writes a stand-in and sleeps.
+write_header "${f_src}/stub-prior.age" X25519
+f_term="$(fresh_dir)"
+f_pidfile="${tmp}/stub-age-decrypt.pid"
+set +e
+run_test_mode env PATH="$stub_path" STUB_AGE_SLEEP_PIDFILE="$f_pidfile" RECOVERY_MATERIAL_TEST_IDENTITY="${tmp}/plain-identity.txt" \
+  bash "$helper" decrypt-inventory --inventory-dir "$f_term" --ciphertext "${f_src}/stub-prior.age" \
+  --ciphertext-sha256 "$(sha256sum -- "${f_src}/stub-prior.age" | cut -d' ' -f1)" \
+  --identity-archive "${f_src}/archive.age" --archive-sha256 "$archive_sum" >"${tmp}/f-term.out" 2>&1 &
+f_helper_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$f_pidfile" ]] && break
+  sleep 0.1
+done
+f_seen="$(find "$f_term" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')"
+f_helper_bash="$(pgrep -P "$f_helper_pid" -f recovery-material.sh || echo "$f_helper_pid")"
+kill -TERM "$f_helper_bash" 2>/dev/null
+kill -TERM "$(cat "$f_pidfile" 2>/dev/null)" 2>/dev/null
+wait "$f_helper_pid"
+f_rc=$?
+set -e
+if [[ "$f_seen" == "identity-archive.age previous-inventory.age previous-inventory.md " && "$f_rc" -eq 143 ]] \
+  && empty_dir "$f_term" && ! leaked "${tmp}/f-term.out"; then
+  pass "decrypt-inventory: TERM during decryption removes the plaintext and copies and exits 143"
+else
+  fail "decrypt-inventory TERM" "exit ${f_rc}; seen before: ${f_seen}; left: $(find "$f_term" -mindepth 1 -maxdepth 1 -printf '%f ')"
 fi
 
 echo

@@ -458,6 +458,8 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
    ```
 
    The scan must report no findings. It prints only path, line number and rule name.
+
+   **To update an existing inventory**, do not copy the template. Follow [Updating an existing inventory](#updating-an-existing-inventory) in place of this step; it ends by returning to step 3.
 3. **Encrypt, upload, download and verify** on the workstation, as in steps 1, 3, 4 and 6 above, with `--item recovery-inventory`:
 
    ```bash
@@ -485,6 +487,83 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
    ```
 
    Then stop the WSL keep-alive. **Leave `$run` as it is.** Its cleanup waits until both offline copies are verified; see [Workstation run cleanup](#workstation-run-cleanup-after-both-offline-copies).
+
+### Updating an existing inventory
+
+Use this in place of step 2 when a run changes items that the previous inventory already records. The new inventory starts from the previous one. **It decrypts the previous inventory on the workstation, which needs its own explicit approval.** The plaintext exists only inside the inventory tmpfs from step 1, and `age` reads the passphrase only at its own `/dev/tty` prompt.
+
+Two values must be explicitly approved for the run before it starts. They are written nowhere else:
+- **the identity-archive path**: one fixed path to the passphrase-encrypted identity archive. Its expected SHA-256 is the archive value in [The age identity](#the-age-identity);
+- **the previous inventory ciphertext**: the exact-version downloaded ciphertext of the inventory being replaced, kept from its run or copied from its verified offline copy. Its expected SHA-256 is the inventory ciphertext SHA-256 recorded for that run in the [validation record](../validation/encrypted-recovery-material.md). It must not be inside `$inv` or `$run`.
+
+1. **Gates.** Run these in the same WSL shell as step 1, in an interactive terminal:
+
+   ```bash
+   pgrep -fx 'sleep 14400'                         # the keep-alive (prerequisite 3) must still be running
+   swapon --show                                   # must print nothing
+   findmnt -no FSTYPE --mountpoint "$inv"          # must print: tmpfs
+   stat -c '%a %U' "$inv"                          # must print: 700 <your user>
+   umask 077
+   archive=<approved identity-archive path>
+   prior=<approved path of the previous inventory ciphertext>
+   ```
+
+   Stop if any check differs. Without the keep-alive, WSL can shut down and lose the tmpfs mid-update.
+2. **Decrypt the previous inventory into the tmpfs:**
+
+   ```bash
+   bash scripts/recovery-material.sh decrypt-inventory --inventory-dir "$inv" \
+     --ciphertext "$prior" --ciphertext-sha256 <recorded previous inventory ciphertext SHA-256> \
+     --identity-archive "$archive" --archive-sha256 <identity-archive SHA-256 from The age identity>
+   ```
+
+   It runs as you, not through `sudo`. Before decrypting, it refuses:
+   - an inventory directory that is not a mode `700` tmpfs mount point owned by you;
+   - active swap, or no terminal for the passphrase prompt;
+   - an existing `previous-inventory.md` or `recovery-material-inventory.md`;
+   - an input that is not a regular file, is or lies under a symbolic link, is inside the tmpfs, or differs from its expected SHA-256 and header (one X25519 stanza for the ciphertext, one scrypt stanza for the archive).
+
+   The checks apply to private copies in the tmpfs, which are what `age` reads; the originals are only read. Then `age` prompts for the passphrase and writes `$inv/previous-inventory.md`. The helper requires a nonempty, singly linked, mode `600` regular file that passes the inventory check, and otherwise removes it. It removes its copies on exit, including after `INT`, `TERM` or `HUP`. It prints only check results, the output path and `result: PASS`. It prints nothing from the plaintext and no version ID.
+3. **Build the replacement inside the tmpfs**, with the same editor settings as step 2:
+
+   ```bash
+   install -m 0600 -- "$inv/previous-inventory.md" "$inv/recovery-material-inventory.md"
+   vim -n -i NONE -c 'set nobackup nowritebackup noundofile' "$inv/recovery-material-inventory.md"
+   ```
+
+   In the editor:
+   - set **Inventory date** to this run's date;
+   - set **Previous inventory object** to the exact object key of the inventory being replaced, `recovery/recovery-inventory/<previous YYYY-MM-DD>.age`;
+   - update the rows of the items this run changed, reading any version ID from its receipt inside the editor (for example with `:r`);
+   - mark a replaced item's earlier entry as superseded rather than deleting it.
+
+   Never display, search, page or copy either plaintext file, and never open it in any other editor or in Windows. Version IDs stay inside the editor and the tmpfs.
+4. **Validate the replacement:**
+
+   ```bash
+   python3 scripts/validate-recovery-material.py --check-inventory "$inv/recovery-material-inventory.md" \
+     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age
+   python3 scripts/validate-recovery-material.py --scan "$inv/recovery-material-inventory.md"
+   ```
+
+   `--check-inventory` must print `PASS`. It requires:
+   - a regular file;
+   - no secret-shaped content;
+   - every required inventory row, with no template placeholder left;
+   - **Previous inventory object** equal to the given key.
+
+   Like `--scan`, it prints only path, line number and rule name, never a value.
+5. **Remove the previous plaintext before encrypting:**
+
+   ```bash
+   rm -f -- "$inv/previous-inventory.md"
+   test ! -e "$inv/previous-inventory.md" && echo "previous plaintext: removed"
+   ```
+
+   `encrypt` refuses the inventory while `previous-inventory.md`, or a decryption copy, is still beside it.
+6. **Only then continue with step 3**, passing `--identity-archive "$archive"` to `verify`, then steps 4 and 5.
+
+The previous inventory ciphertext is never overwritten, moved or deleted. `decrypt-inventory` only reads it, and `encrypt` writes only a new file in `$run`, never over an existing path. The [workstation run cleanup](#workstation-run-cleanup-after-both-offline-copies) names it with `--keep` to confirm that it is unchanged, and only after both recovery devices have verified the exact-version downloaded replacement.
 
 ## Offline copies on Recovery A and B
 
@@ -525,7 +604,7 @@ bash scripts/recovery-material.sh cleanup --dir "$run" \
   --keep ~/hc-recovery/<retained ciphertext>
 ```
 
-Name with `--remove` exactly the files this run put in `$run`. For the `encryption-config` run, they are `encryption-config.age`, `encryption-config.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. Name with `--keep`, one per option, every ciphertext kept from an earlier run, such as each Stage 2 copy directly under `~/hc-recovery`. `cleanup` must print `run directory: absent`, `retained unchanged:` for each kept file, and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)).
+Name with `--remove` exactly the files this run put in `$run`. For the `encryption-config` run, they are `encryption-config.age`, `encryption-config.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. Name with `--keep`, one per option, every ciphertext kept from an earlier run, such as each Stage 2 copy directly under `~/hc-recovery`. After an [inventory update](#updating-an-existing-inventory), also pass `--keep "$prior"`, so that `cleanup` confirms the previous inventory ciphertext is unchanged. `cleanup` must print `run directory: absent`, `retained unchanged:` for each kept file, and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)).
 
 ## Stop conditions
 
@@ -598,6 +677,7 @@ Scan each evidence file before archiving it: `python3 scripts/validate-recovery-
 | Refusal paths and the S3 helper | CI and any Linux host with bash (groups A and C) | Guards, header checks, a TERM trap test, and the S3 helper against a stub `aws` command, including a zero-byte checksum case |
 | The `encryption-config` item | CI and any Linux host with bash (group D); its round trips need real `age` v1.3.2, which CI requires | A synthetic configuration with a random key. Covered: source checks (missing, symbolic link, directory, FIFO, device, empty, ownership simulated by a test-mode owner override, every group or other mode bit); path binding through the test-only expected-source override (the exact path accepted; an alternate file, relative and normalized aliases, a final-component or ancestor symbolic link, a differing canonical path by stub, a missing or non-directory credential directory, wrong directory ownership and a group- or other-writable directory refused); refusal of every test-only variable outside test mode and of test mode as root; the committed production path; `age` version refusals; invalid headers; `MATCH`, `DIFFER` and `ERROR`; cleanup after success, command failure, comparison failure and `TERM`, `HUP` and `INT`; receipt-based upload and exact-version download, including mismatched versions and receipts, and receipts, FIFOs and links planted during an upload; and that no key, key name, plaintext hash, bucket name or receipt-held version ID is printed |
 | Run directories and scoped cleanup | CI and any Linux host with bash (group E), as in production, with no test mode | `start-run` (mode `700` and marker; an existing directory, a relative path and a symbolic-link parent refused); `cleanup` removing only the named run files and the directory while each retained ciphertext beside it stays byte-identical; refusal, with nothing removed, of a retained ciphertext copied into the run directory (named or not), a `..` name, a wildcard or unrelated name, the retained directory itself, a duplicate or missing name, symbolic and hard links to a retained ciphertext, a symbolic-link directory, path, marker or kept file, a kept file inside the run directory, an unexpected subdirectory and a directory that is not mode `700`; and mutants with the timestamp, exact-contents, name or marker guard disabled, each caught |
+| Inventory update (`decrypt-inventory`) | CI and any Linux host with bash (group F); decryption cases need real `age` v1.3.2, which CI requires. The scanner's mutation tests cover the runbook procedure | A synthetic previous inventory with a throwaway identity: decryption only to `previous-inventory.md`, mode `600` and byte-identical, with the private copies removed; refusal, with nothing left behind, of a wrong or malformed SHA-256, an archive without one scrypt stanza, a ciphertext with two stanzas, symbolic links and symbolic-link paths, a relative path, a missing file, an input inside the tmpfs, a directory that is not mode `700` or is a link, an existing previous plaintext or replacement, and, outside test mode, a directory that is not a tmpfs; removal of the plaintext after a wrong identity, a failed inventory check, an empty result and `TERM`; `encrypt` refusing the inventory beside a leftover previous plaintext or copy, and never overwriting the previous ciphertext; mutants with the SHA-256, plaintext-removal, tmpfs or encrypt guard disabled, each caught. The runbook checks reject a decryption outside the helper or the tmpfs, missing keep-alive, swap or tmpfs gates, plaintext output or an unsafe editor, a missing validation or plaintext removal before encryption, a write to or removal of the previous ciphertext, and a run cleanup before both offline copies |
 | Limited Windows probes | Run once by hand with `age.exe` v1.3.2 and a throwaway key | That real v1.3.2 X25519 ciphertext has exactly one stanza and passes the header check, and one encrypt/decrypt round trip. They do not run the Linux helpers |
 
 **Untested by any of them:**
