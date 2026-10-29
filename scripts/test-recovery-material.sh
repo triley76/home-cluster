@@ -1251,7 +1251,7 @@ if (( real_age_ok )); then
   age-keygen -y "${f_key}/identity" >"${f_key}/recipient"
   age-keygen -o "${f_key}/other-identity" 2>/dev/null
   # The previous inventory: the template plus a sentinel row that must never be printed.
-  { cat -- "$template"; printf '\n| Note | `%s` |\n' "$sentinel"; } >"${f_key}/previous.md"
+  { cat -- "$template"; printf '\n| Note | %s |\n' "\`${sentinel}\`"; } >"${f_key}/previous.md"
   age -R "${f_key}/recipient" -o "${f_src}/previous.age" -- "${f_key}/previous.md"
   prior="${f_src}/previous.age"
   prior_sum="$(sha256sum -- "$prior" | cut -d' ' -f1)"
@@ -1425,13 +1425,11 @@ if (( real_age_ok )); then
       pass "decrypt-inventory mutant: ${label}: killed by ${scenario#scenario_}"
     fi
   }
-  # shellcheck disable=SC2016
   f_mutant_case "no ciphertext SHA-256 guard" 's/|| die "the previous inventory ciphertext does not have/|| : "/' scenario_wrong_sum
   f_mutant_case "plaintext kept after a failed check" 's/if (( ! decrypt_done )); then/if false; then/' scenario_failed_check
   f_mutant_case "no tmpfs guard" 's/|| die "the inventory directory is not a tmpfs mount point/|| : "/' scenario_not_tmpfs
-  # shellcheck disable=SC2016
-  f_mutant_case "no encrypt guard for the previous plaintext" 's/|| die "remove ${leftover} from/|| : "/' \
-    scenario_encrypt_beside_previous
+  f_mutant_case "no encrypt guard for the previous plaintext" \
+    's/|| die "remove \(.*\) from the inventory directory before encrypting/|| : "\1/' scenario_encrypt_beside_previous
   if prior_unchanged; then pass "decrypt-inventory: previous ciphertext unchanged after every case and mutant"; else fail "decrypt-inventory" "prior changed"; fi
 elif [[ "${RECOVERY_MATERIAL_REQUIRE_AGE:-}" == "1" ]]; then
   fail "group F" "age and age-keygen v1.3.2 are required (RECOVERY_MATERIAL_REQUIRE_AGE=1)"
@@ -1454,7 +1452,7 @@ for _ in $(seq 1 100); do
   [[ -s "$f_pidfile" ]] && break
   sleep 0.1
 done
-f_seen="$(ls -A -- "$f_term" | sort | tr '\n' ' ')"
+f_seen="$(find "$f_term" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')"
 f_helper_bash="$(pgrep -P "$f_helper_pid" -f recovery-material.sh || echo "$f_helper_pid")"
 kill -TERM "$f_helper_bash" 2>/dev/null
 kill -TERM "$(cat "$f_pidfile" 2>/dev/null)" 2>/dev/null
