@@ -1,6 +1,6 @@
 # Runbook: encrypted recovery material (Stage 2)
 
-**Status:** executed from 2026-10-16 to 2026-10-19 UTC. The K3s server token, the Grafana admin credential and the filled recovery-material inventory were each encrypted, uploaded, downloaded by exact version and verified, and the inventory was copied to Recovery A and Recovery B. The results, and a cluster incident that interrupted the run, are recorded in the [encrypted recovery material validation](../validation/encrypted-recovery-material.md). Later runs, after any item changes, follow the same procedure and are recorded the same way.
+**Status:** executed from 2026-10-16 to 2026-10-19 UTC. The K3s server token, the Grafana admin credential and the filled recovery-material inventory were each encrypted, uploaded, downloaded by exact version and verified, and the inventory was copied to Recovery A and Recovery B. The results, and a cluster incident that interrupted the run, are recorded in the [encrypted recovery material validation](../validation/encrypted-recovery-material.md). The Stage 3 `encryption-config` item was run on 2026-10-29 UTC, with an updated inventory copied to both recovery devices; see the [Stage 3 section of the validation record](../validation/encrypted-recovery-material.md#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29). Later runs, after any item changes, follow the same procedure and are recorded the same way.
 
 This runbook implements Stage 2 of the [backup and disaster recovery design](../design/backup-disaster-recovery.md), following its [recovery material and client-side encryption](../design/backup-disaster-recovery.md#recovery-material-and-client-side-encryption) rules.
 
@@ -89,6 +89,14 @@ It does not record how the bucket name was configured (item 6), or whether the s
    - WSL: `swap=0` in `.wslconfig`, then a WSL restart.
 
    `verify` refuses to run while swap is active.
+
+   **Keep WSL running while the inventory tmpfs exists.** WSL shuts its virtual machine down shortly after the last WSL process exits. That unmounts every tmpfs, including the inventory tmpfs and any upload receipt in it. *Observed 2026-10-29:* between two steps, with no WSL process left running, the VM shut down and was started again by the next command. The `encryption-config` receipt was lost (see [Partial failure](#partial-failure)). Before creating the inventory tmpfs, start a keep-alive in its own Windows terminal:
+
+   ```powershell
+   wsl.exe -e sleep 14400
+   ```
+
+   Keep it running until the [inventory cleanup](#the-filled-inventory) has completed, then stop it. Commands run one at a time through `wsl.exe` do not keep the VM alive between them.
 
    **Changing swap state on a K3s server is a live node change.** Do it only as a separately approved step, with a fresh snapshot in place. During the Stage 2 run, the first server's local Kubernetes API became unavailable after a temporary swap-state change on that node. The cause was not determined; see the [validation record](../validation/encrypted-recovery-material.md#cluster-incident-and-recovery). If swap is active on a source host, stop and decide separately how to proceed.
 4. **`/dev/tty` passphrase gate.** On each host that will run `verify`, run it once with a throwaway identity archive that you create interactively with `age -p`. This confirms that `age` v1.3.2 prompts on `/dev/tty`, with stdin from `/dev/null` and under `sudo`, and that `MATCH` is reported. The repository tests cannot exercise this, because they would need a terminal and a passphrase.
@@ -231,7 +239,7 @@ These checks use file names and mount tables only; they never read file contents
 
 ## The K3s secrets-encryption configuration (Stage 3)
 
-**Status:** implemented and tested with synthetic data only. It has not been run against the live cluster; no real configuration has been read, encrypted, uploaded or verified.
+**Status:** run against the live cluster on 2026-10-29 UTC, after homelab-k3s's second restart round, enforced-enabled validation and p2. All four completion checks passed for the same object version; see the [validation record](../validation/encrypted-recovery-material.md#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29). Before that it was tested with synthetic data only.
 
 The homelab-k3s Stage 3 procedure enables K3s secretbox encryption at rest and rotates its key once. The key exists only in `/var/lib/rancher/k3s/server/cred/encryption-config.json`, identical on every server after the second restart round, and in K3s bootstrap data in etcd, encrypted with the server token. Restoring a post-activation snapshot onto servers that have lost that file, from the snapshot and the token alone, is untested. This recovery copy is therefore required: without the key, every Secret encrypted under it is lost, whatever snapshots survive. The Stage 3 side of this dependency is described in homelab-k3s `docs/secrets-encryption.md`, section "Key material and the off-node recovery copy".
 
@@ -379,9 +387,9 @@ On any of these, Stage 3 stays incomplete. The cluster keeps running encrypted, 
 
 ### Required cross-repository follow-up (homelab-k3s)
 
-homelab-k3s `docs/secrets-encryption.md`, section "Key material and the off-node recovery copy", must be aligned with this helper before the Stage 3 live run. Open as of this change:
-- **Remove the source file's size from the metadata it says may be recorded.** This helper never records the plaintext or source size, only its mode, ownership and path checks, and the ciphertext's size and SHA-256.
-- **Replace `MATCH`/`MISMATCH` with `MATCH`, `DIFFER` or `ERROR`**, the results the helper reports.
+**Resolved before the live run:** homelab-k3s `docs/secrets-encryption.md`, section "Key material and the off-node recovery copy", was aligned with this helper in homelab-k3s commit `a5991e5` (pull request #6, merged in `09ce4af`):
+- the source file's size was removed from the metadata it says may be recorded. This helper never records the plaintext or source size, only its mode, ownership and path checks, and the ciphertext's size and SHA-256;
+- `MATCH`/`MISMATCH` was replaced with `MATCH`, `DIFFER` or `ERROR`, the results the helper reports.
 
 ## The filled inventory
 
@@ -395,6 +403,7 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
 
    ```bash
    inv=/run/hc-inventory
+   pgrep -fx 'sleep 14400'                         # the WSL keep-alive (prerequisite 3) must be running
    swapon --show                                   # must print nothing
    sudo install -d -m 0700 -o root -g root "$inv"
    sudo mount -t tmpfs -o size=4m,mode=0700,uid="$(id -u)",gid="$(id -g)",noexec,nosuid,nodev hc-inventory "$inv"
@@ -440,6 +449,8 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
    find ~/hc-recovery -maxdepth 1 -type f -name '*.age' | wc -l    # must print 0
    ```
 
+   Then stop the WSL keep-alive.
+
 ## Offline copies on Recovery A and B
 
 Only one recovery device is connected at a time. Copy and check sequentially, from Windows PowerShell. Use `\\wsl.localhost\Ubuntu\...` for the WSL source path, and never mount the recovery media inside WSL.
@@ -475,6 +486,9 @@ Stop the run, record the outcome only, and do not improvise if:
 
 - **Upload succeeded, verification failed:** the object stays as an unverified version. Mark it unverified in the inventory, fix the cause, and re-run with `upload --new-version`. The routine role cannot delete objects.
 - **Download or comparison failed:** a failed or rejected download leaves nothing at `--out`. Re-run step 4 from the same version ID. If it still fails, treat the uploaded version as unverified.
+- **Inventory tmpfs lost after an upload** (for example, WSL shut down): the uploaded version is intact, but its receipt is gone. Stop, start the keep-alive, and recreate the tmpfs. Then either:
+  - upload again with `--new-version` and a new receipt, and repeat the comparisons; or
+  - with separate approval, rebuild the receipt from read-only S3 metadata, as on 2026-10-29. The listing must hold exactly one version and no delete marker for the exact key, the latest version, the recorded ciphertext size, and a `ChecksumSHA256` equal to the recorded ciphertext SHA-256. Write the receipt in the helper's two-line format, exclusively, mode 600, without printing the version ID. Prove it with `download --receipt … --compare-with` against the original ciphertext, which must report `result: MATCH`, and record the reconstruction as a deviation.
 - **Verification interrupted:** `verify` removes its tmpfs files and unmounts its tmpfs, keeps the original failure status, and reports any cleanup failure. Confirm that `findmnt -t tmpfs -S recovery-material` prints nothing before retrying.
 - **Stopped part-way through:** run the per-host cleanup on every host already used, and the inventory cleanup if its tmpfs exists, before anything else.
 

@@ -6,6 +6,8 @@ This record documents the observed results of Stage 2 of the [backup and disaste
 
 It also documents a cluster incident that interrupted the work, and the cluster's restoration from a local etcd snapshot.
 
+The Stage 3 `encryption-config` recovery copy and the updated inventory, made on 2026-10-29, are recorded in their [own section](#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29), with their own evidence statement.
+
 All evidence below was supplied by the repository owner. It was not independently accessed while this record was prepared.
 - Sanitized evidence files are stored outside this repository and identified by file name and SHA-256.
 - Results without an evidence file were observed in terminal output. Private receipts for them were retained outside Git.
@@ -248,5 +250,83 @@ Every stated condition of the gate has been observed. The gate is a precondition
 - **That any recovery material restores a cluster.** No restore rehearsal from the off-cluster recovery material has been performed. The incident restoration used a local etcd snapshot and the server token already present on the servers, not the uploaded recovery material. It is therefore not a rehearsal of the design's Track A.
 - **The root cause of the incident.**
 - **Scheduled backup operation.** The [human access gate](#human-access-gate) has been met, but no backup schedule exists yet.
-- **Stage 3 or later work.** Secrets encryption at rest, scheduled etcd uploads, volume backups and machine access keys are not part of Stage 2.
+- **Stage 3 or later work.** Secrets encryption at rest, scheduled etcd uploads, volume backups and machine access keys are not part of Stage 2. The Stage 3 recovery copy is recorded [below](#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29).
 - **Recoverability of anything,** beyond the ciphertext-to-plaintext verifications above. See [Evidence boundaries](../design/backup-disaster-recovery.md#evidence-boundaries-and-claims-not-to-make).
+
+## Stage 3: the K3s secrets-encryption configuration (2026-10-29)
+
+This section records the [`encryption-config` procedure](../runbooks/encrypted-recovery-material.md#the-k3s-secrets-encryption-configuration-stage-3) run against the live cluster on 2026-10-29 UTC, from 15:30 to 16:50, and the inventory update that followed it.
+
+**How the evidence was produced:**
+- The work was run by an operator session, with each step approved by the repository owner. The owner ran the steps that needed the identity-archive passphrase or administrator rights: both `verify` runs, the decryption of the previous inventory, and the recovery-media copies. The owner reported their results.
+- Sanitized evidence is stored outside this repository: directory `stage3-encryption-config-recovery-copy-20261029T165000Z`, 38 files, whose `SHA256SUMS` manifest has SHA-256 `c9f0e9c3ee4c967fd7de8b71234ab70d716835cab85c885da61f9a69ce0baffc`. The scanner reported no findings in any of them.
+- The same exclusions apply as for Stage 2. In addition, no part of the configuration, no key name, and no plaintext size or hash is recorded.
+
+### Timing and implementation
+
+| Item | Value |
+| --- | --- |
+| Follows | homelab-k3s's single `rotate-keys` (2026-10-29), its second restart round on all three servers, the enforced `enabled` validation, and p2 `stage3-p2-post-encryption-20261029t144551z-k3s01-1793285175` |
+| home-cluster helpers | Reviewed `main` commit `9f46215bd55681ff2a5006e95d9a3869d19bbf17` (pull request #21 merged), installed on `k3s01` from `git archive`; both files matched the commit's blobs |
+| homelab-k3s | `main` commit `7fd364ffefe11698dbd6ca1d293f73d6bbe35b45` |
+| Routine AWS access | `HomeClusterBackupOperator` only; `check-role` printed `PASS` before every AWS step. The IAM Identity Center session had expired at the first preflight and was renewed by the owner before any AWS step |
+
+### Preflight
+
+| Check | Observed |
+| --- | --- |
+| Cluster | All nodes Ready; local APIs and etcd ready; three-member full mesh; workloads, Flux and storage healthy; `Enabled`, `reencrypt_finished` and matching hashes on all three servers; p2 the newest Stage 3 snapshot, intact and recorded |
+| Source, by metadata only | `600 root:root regular file`, nonempty, not a symbolic link, at exactly the expected path. The credential directory was `700 root:root`, not group- or other-writable, with no symbolic link above it |
+| Swap | None active on `k3s01` or in WSL (`swap=0`) |
+| `age` | v1.3.2 on `k3s01` and in WSL |
+| Bucket configuration, read with the routine role | Versioning `Enabled`; all four Block Public Access settings `true`; policy status not public; default encryption `AES256`; ownership `BucketOwnerEnforced` |
+| Destinations | Both `2026-10-29` keys absent before upload; the only previous inventory object was `recovery/recovery-inventory/2026-10-18.age` |
+| Identity archive | The passphrase-encrypted archive's ciphertext SHA-256 matched the value recorded above before each use |
+
+### Results
+
+| Item | Object key | Ciphertext | Upload | Exact-version download | Decryption comparison | `cmp -s` exit status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `encryption-config` | `recovery/encryption-config/2026-10-29.age` | 472 bytes, SHA-256 `12182aec61bcaf1839eb882292617d1fa871ea3d9605116ff382713f8c9f2e6c` | PASS, receipt-based | `MATCH` | `MATCH` against the live source, on `k3s01`, with the recovery tmpfs absent afterwards | 0 |
+| `recovery-inventory` | `recovery/recovery-inventory/2026-10-29.age` | 6191 bytes, SHA-256 `c85b47c6a27be89ca7583836f46f6265bb0a6c527c685da110ea0d9a26e4235b` | PASS, receipt-based | `MATCH` | `MATCH` against the prepared inventory, on the workstation | 0 |
+
+All four Stage 3 completion checks passed for the same `encryption-config` object version. Its recovery-copy status is `verified`. This is the first such copy, so nothing is superseded.
+
+### The updated inventory
+
+- **Built only in a private WSL tmpfs**, from the 2026-10-18 inventory, which was decrypted into that tmpfs only.
+- **Rows:** the four placeholder rows of the earlier template for the secrets-encryption material were replaced by the ten current `K3s secrets-encryption configuration` rows. The record fields and tool versions were updated. Previous inventory object: `recovery/recovery-inventory/2026-10-18.age`.
+- **Checks:** 56 table rows, no placeholders left, and no scanner findings.
+- **Version IDs:** both were read from their receipts directly into the inventory and never displayed.
+- **Copies:** the exact-version downloaded, byte-matched ciphertext was copied to both recovery devices.
+
+| Copy | Size | SHA-256 | BitLocker state before the copy | Comparison | Afterwards |
+| --- | --- | --- | --- | --- | --- |
+| Recovery A | 6191 bytes | `c85b47c6…235b` | Unlocked; fully encrypted; protection On; AES-256; automatic unlock disabled | PASS. Create-new, nothing overwritten; the Stage 2 copy is still present | Safely ejected and disconnected |
+| Recovery B | 6191 bytes | `c85b47c6…235b` | Same | PASS. Create-new; the Stage 2 copy is still present | Safely ejected and disconnected |
+
+### Cleanup
+
+| Host | Observed |
+| --- | --- |
+| `k3s01` | The transported identity archive, all `.age` files and the helper copy were removed. No recovery tmpfs. The live source is still present |
+| Workstation (WSL) | The inventory plaintext, both receipts and the inventory tmpfs were removed. The run's private working directory and its five ciphertexts were removed. The keep-alive was stopped. Both Stage 2 inventory ciphertexts, which match each other, and the Stage 2 working directories are untouched |
+
+### Deviations and qualifications
+
+- **WSL shut down and took the encryption-config receipt with it.** The WSL virtual machine shut down between steps while no WSL process was running, and the next command started it again at 15:53:36 UTC. That removed the inventory tmpfs and the `encryption-config` receipt; no plaintext was in it. With approval, the receipt was rebuilt from read-only S3 metadata:
+  - exactly one version and no delete marker for the exact key, the latest version, 472 bytes;
+  - `ChecksumSHA256` equal to the ciphertext SHA-256;
+  - written in the helper's format without printing the version ID;
+  - proven by an exact-version download that reported `MATCH` against the original ciphertext.
+
+  No second version was uploaded. The [runbook](../runbooks/encrypted-recovery-material.md#prerequisites-and-live-pass-gates) now requires a WSL keep-alive.
+- **Decrypting the previous inventory.** The 2026-10-18 inventory was decrypted with `age -d` into the inventory tmpfs, outside the helper, to update it. This was approved.
+- **Editing the inventory.** It was edited by a script inside the tmpfs instead of `vim`, printing only row labels and counts. This was approved.
+- **Workstation working files.** These were kept in a new private subdirectory, so that the runbook's cleanup could not remove the Stage 2 ciphertexts that share `~/hc-recovery`. This was approved.
+
+### What this section does not show
+
+- **That the copy restores the key onto servers that lost it.** No restore rehearsal from the off-node recovery material was performed.
+- **Hypervisor paging.** That host page files or VM swap files did not hold recovery plaintext; see the runbook's [residual risks](../runbooks/encrypted-recovery-material.md#residual-risks).
+- **Scheduled operation.** No backup schedule exists yet.
