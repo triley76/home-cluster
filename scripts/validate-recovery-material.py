@@ -14,7 +14,14 @@ and checks that:
   - recovery/ holds exactly the committed public recipient, in the expected format;
   - the blank inventory template contains placeholders only, keeps every required
     row, and has no field for a plaintext-derived value;
-  - the recovery-material helpers do not enable tracing or print or hash plaintext.
+  - the recovery-material helpers do not enable tracing or print or hash plaintext;
+  - the recovery-material runbook removes run files only through the helper's scoped
+    cleanup, never with a wildcard or recursive rm, which could delete ciphertexts
+    retained from earlier runs;
+  - the runbook instructs the workstation run cleanup only after both offline
+    copies (Recovery A and B) of the exact-version downloaded inventory ciphertext
+    are verified, keeps the whole run directory while either is pending, and makes
+    that a mandatory stop condition.
 
 A finding is reported as path, line number and rule name only. Matched text is
 never printed, so a failing run cannot leak the value it found.
@@ -61,6 +68,33 @@ HELPER_RULES = (
     ("helper-plaintext-digest", re.compile(r"\b(?:sha\d*sum|md5sum|b2sum|openssl\s+dgst)\b[^\n|]*(?:\$\{?(?:src|source|plain\w*)\b|/plain\b)")),
     ("helper-plaintext-output", re.compile(r"\b(?:cat|echo|printf|head|tail|xxd|od|less|more)\b[^\n]*(?:/plain\b|\$\{?src\}?\")")),
 )
+
+RUNBOOK = "docs/runbooks/encrypted-recovery-material.md"
+# An rm with a wildcard or a recursive option, outside a trailing comment.
+RUNBOOK_RULES = (
+    ("runbook-broad-delete", re.compile(r"\brm\b[^\n#]*?(?:\*|\s-[A-Za-z]*[rR]|--recursive)")),
+)
+# The per-host (k3s01) and workstation cleanups both use the scoped helper.
+SCOPED_CLEANUP = "recovery-material.sh cleanup --dir"
+SCOPED_CLEANUP_MIN = 2
+# The workstation run cleanup removes the run's inventory ciphertexts. The runbook may
+# instruct it only in its gated subsection of the offline-copies section, after the
+# per-device copy steps, and must keep the whole run directory while a copy is pending.
+OFFLINE_SECTION = "## Offline copies on Recovery A and B"
+OFFLINE_GATE = "### Workstation run cleanup (after both offline copies)"
+OFFLINE_LOCK_STEP = "manage-bde -lock"
+WORKSTATION_CLEANUP = 'recovery-material.sh cleanup --dir "$run"'
+OFFLINE_GATE_PHRASES = (
+    "Do not run the workstation run cleanup until Recovery A and Recovery B have both verified"
+    " the exact-version downloaded inventory ciphertext",
+    "If either device is pending or unavailable, keep the entire run directory",
+    "do not remove any file from it, even one unrelated to the pending copy",
+    "do not move or copy its inventory ciphertext into `~/hc-recovery`",
+)
+STOP_SECTION = "## Stop conditions"
+OFFLINE_STOP = "an offline copy is pending or unverified when the workstation run cleanup is due. This stop is mandatory"
+# The offline copies are made from the exact-version downloaded inventory ciphertext.
+OFFLINE_SOURCE = "\\hc-recovery\\run-<YYYY-MM-DD>\\recovery-inventory.downloaded.age'"
 
 SECRET_NAMES = {"keys.txt", "token", "credentials", "kubeconfig", "recovery-material-inventory.md"}
 SECRET_SUFFIXES = {".age", ".pem", ".key", ".p12", ".pfx", ".kubeconfig"}
@@ -138,11 +172,58 @@ def scan_file(root: Path, path: str, findings: list[tuple[str, int, str]], names
     text = (root / path).read_bytes().decode("utf-8", errors="replace")
     if text.lstrip().startswith(AGE_CIPHERTEXT_STARTS):
         findings.append((path, 1, "age-ciphertext"))
-    rules = CONTENT_RULES + (HELPER_RULES if path in HELPERS else ())
+    rules = CONTENT_RULES + (HELPER_RULES if path in HELPERS else ()) + (RUNBOOK_RULES if path == RUNBOOK else ())
     for number, line in enumerate(text.splitlines(), 1):
         for rule, pattern in rules:
             if pattern.search(line):
                 findings.append((path, number, rule))
+
+
+def headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(index, level, text) of each Markdown heading outside code fences."""
+    marks, fence = [], False
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence = not fence
+        elif not fence and re.match(r"#{1,6} ", line):
+            marks.append((index, len(line) - len(line.lstrip("#")), line.rstrip()))
+    return marks
+
+
+def section_span(lines: list[str], heading: str) -> tuple[int, int] | None:
+    """Line range of a section, from its heading to the next heading of the same or a higher level."""
+    marks = headings(lines)
+    for number, (index, level, text) in enumerate(marks):
+        if text == heading:
+            end = next((later for later, depth, _ in marks[number + 1:] if depth <= level), len(lines))
+            return index, end
+    return None
+
+
+def offline_gate_findings(text: str) -> list[tuple[str, int, str]]:
+    lines = text.splitlines()
+    found = []
+    offline = section_span(lines, OFFLINE_SECTION) or (len(lines), len(lines))
+    gate = section_span(lines, OFFLINE_GATE)
+    if gate is None or not (offline[0] < gate[0] and gate[1] <= offline[1]):
+        found.append((RUNBOOK, 0, "runbook-offline-gate-missing"))
+        gate = gate or (len(lines), len(lines))
+    first = next((i for i in range(*gate) if WORKSTATION_CLEANUP in lines[i]), gate[1])
+    preamble = "\n".join(lines[gate[0]:first])
+    if any(phrase not in preamble for phrase in OFFLINE_GATE_PHRASES):
+        found.append((RUNBOOK, 0, "runbook-offline-gate-missing"))
+    if not any(OFFLINE_LOCK_STEP in lines[i] for i in range(offline[0], gate[0])):
+        found.append((RUNBOOK, 0, "runbook-cleanup-before-offline-copies"))
+    for index, line in enumerate(lines):
+        if WORKSTATION_CLEANUP in line and not gate[0] < index < gate[1]:
+            found.append((RUNBOOK, index + 1, "runbook-cleanup-before-offline-copies"))
+    stop = section_span(lines, STOP_SECTION) or (0, 0)
+    if OFFLINE_STOP not in "\n".join(lines[stop[0]:stop[1]]):
+        found.append((RUNBOOK, 0, "runbook-offline-stop-missing"))
+    sources = [line.strip() for line in lines[offline[0]:offline[1]] if line.strip().startswith("$src")]
+    if not sources or any(not line.endswith(OFFLINE_SOURCE) for line in sources):
+        found.append((RUNBOOK, 0, "runbook-offline-source"))
+    return found
 
 
 def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
@@ -160,6 +241,12 @@ def check(root: Path) -> tuple[list[tuple[str, int, str]], int]:
     for path in recovery:
         if path != RECIPIENT:
             findings.append((path, 0, "recovery-unexpected-file"))
+
+    if RUNBOOK in files:
+        runbook = (root / RUNBOOK).read_text(encoding="utf-8")
+        if runbook.count(SCOPED_CLEANUP) < SCOPED_CLEANUP_MIN:
+            findings.append((RUNBOOK, 0, "runbook-scoped-cleanup-missing"))
+        findings.extend(offline_gate_findings(runbook))
 
     if TEMPLATE not in files:
         findings.append((TEMPLATE, 0, "inventory-template-missing"))

@@ -9,6 +9,10 @@
 # Group D: the encryption-config item (K3s secrets-encryption configuration) with a
 #          synthetic configuration: source checks, refusals, interruption cleanup,
 #          round trips (real age, as in group B) and receipt-based S3 transfers.
+# Group E: start-run and the scoped cleanup, as in production (no test mode): a
+#          retained prior ciphertext beside or copied into a run directory is never
+#          removed, every refusal removes nothing, and mutants with a guard disabled
+#          are caught.
 #
 # Every run uses RECOVERY_MATERIAL_TEST=1 overrides or stubs. These tests do NOT
 # exercise production sudo or runuser, the tmpfs mount, the swap check, the /dev/tty
@@ -1015,6 +1019,201 @@ expect "encryption-config: changed object reports DIFFER" 1 "result: DIFFER" -- 
   --out "${tmp}/ec-d9.age" --compare-with "${tmp}/ec-upload.age"
 EXTRA_FORBIDDEN=""
 if empty_dir "$s3_tmp"; then pass "encryption-config: S3 work directories removed after success and failure"; else fail "S3 cleanup" "work directory left behind"; fi
+
+# --- group E: run directories and scoped cleanup ----------------------------------------
+echo "Group E: run directories and scoped cleanup"
+# start-run and cleanup have no test mode: they run exactly as in production, as the
+# invoking (non-root) user. $1 is the helper to run, so that mutants can be tested.
+run_helper() {
+  local helper_path="$1"
+  shift
+  env -u RECOVERY_MATERIAL_TEST -u RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE bash "$helper_path" "$@"
+}
+rm_helper() { run_helper "$helper" "$@"; }
+
+# Stands in for ~/hc-recovery, holding ciphertexts retained from an earlier run under
+# the same names a new run uses, with an older timestamp.
+e_home="$(fresh_dir)"
+retained=("${e_home}/k3s-server-token.age" "${e_home}/recovery-inventory.age" "${e_home}/recovery-inventory.downloaded.age")
+keep_args=()
+for file in "${retained[@]}"; do
+  write_header "$file" X25519
+  touch -d '2026-10-16 12:00:00' "$file"
+  keep_args+=(--keep "$file")
+done
+retained_sums="$(sha256sum -- "${retained[@]}")"
+retained_unchanged() {
+  [[ "$(sha256sum -- "${retained[@]}" 2>/dev/null)" == "$retained_sums" ]]
+}
+
+# new_run HELPER NAME FILE...: a new run directory under e_home, made by start-run,
+# holding fresh ciphertext-shaped files with the given names. Prints its path.
+new_run() {
+  local helper_path="$1" dir="${e_home}/$2" name
+  shift 2
+  run_helper "$helper_path" start-run --dir "$dir" >/dev/null
+  for name in "$@"; do
+    write_header "${dir}/${name}" X25519
+  done
+  printf '%s' "$dir"
+}
+
+e_run="${e_home}/run-start"
+expect "cleanup: start-run creates the run directory" ok "result: PASS" -- rm_helper start-run --dir "$e_run"
+if [[ "$(stat -c '%a %u' -- "$e_run")" == "700 $(id -u)" && -f "${e_run}/.recovery-run" ]]; then
+  pass "cleanup: the run directory is mode 700 with a run marker"
+else
+  fail "start-run" "run directory mode or marker wrong"
+fi
+expect "cleanup: start-run refuses an existing directory" 1 "already exists" -- rm_helper start-run --dir "$e_run"
+expect "cleanup: start-run refuses a relative path" 1 "absolute, normalized path" -- rm_helper start-run --dir run-relative
+ln -s "$e_home" "${tmp}/home-link"
+expect "cleanup: start-run refuses a symbolic-link parent" 1 "parent directory does not exist or is a symbolic link" -- \
+  rm_helper start-run --dir "${tmp}/home-link/run-x"
+expect "cleanup: a run holding only its marker is removed" ok "run directory: absent" -- rm_helper cleanup --dir "$e_run"
+
+# The live layout: run files in the run directory, retained ciphertexts beside it.
+e_run="$(new_run "$helper" run-ok k3s-server-token.age k3s-server-token.downloaded.age recovery-inventory.age \
+  recovery-inventory.downloaded.age identity-archive.age)"
+expect "cleanup: removes the listed run files and keeps the retained ciphertexts" ok "result: PASS" -- \
+  rm_helper cleanup --dir "$e_run" --remove k3s-server-token.age --remove k3s-server-token.downloaded.age \
+  --remove recovery-inventory.age --remove recovery-inventory.downloaded.age --remove identity-archive.age "${keep_args[@]}"
+if [[ ! -e "$e_run" ]] && retained_unchanged && [[ "$(grep -c '^retained unchanged: ' "${tmp}/out")" -eq 3 ]]; then
+  pass "cleanup: run directory absent; each retained ciphertext reported and byte-identical"
+else
+  fail "cleanup" "run directory left, or a retained ciphertext missing, changed or unreported"
+fi
+
+# Regression scenarios. Each returns 0 only when the cleanup refuses with the named
+# guard and removes nothing. They run against the real helper and against mutants.
+#
+# A retained ciphertext copied into a run directory with its old timestamp, under a
+# run file name, and listed for removal.
+scenario_retained_copy_listed() {
+  local helper_path="$1" dir
+  dir="$(new_run "$helper_path" "run-listed-${RANDOM}" k3s-server-token.downloaded.age)"
+  cp -p -- "${e_home}/k3s-server-token.age" "${dir}/k3s-server-token.age"
+  run_helper "$helper_path" cleanup --dir "$dir" --remove k3s-server-token.age \
+    --remove k3s-server-token.downloaded.age "${keep_args[@]}" >"${tmp}/scenario" 2>&1 && return 1
+  grep -qF "predates the run directory" "${tmp}/scenario" \
+    && [[ -f "${dir}/k3s-server-token.age" && -f "${dir}/k3s-server-token.downloaded.age" ]] && retained_unchanged
+}
+# The same kind of copy present but not listed: an unexpected entry.
+scenario_retained_copy_unlisted() {
+  local helper_path="$1" dir
+  dir="$(new_run "$helper_path" "run-unlisted-${RANDOM}" k3s-server-token.downloaded.age)"
+  cp -p -- "${e_home}/recovery-inventory.age" "${dir}/recovery-inventory.age"
+  run_helper "$helper_path" cleanup --dir "$dir" --remove k3s-server-token.downloaded.age >"${tmp}/scenario" 2>&1 && return 1
+  grep -qF "unexpected entry in the run directory" "${tmp}/scenario" \
+    && [[ -f "${dir}/recovery-inventory.age" && -f "${dir}/k3s-server-token.downloaded.age" ]] && retained_unchanged
+}
+# A name that reaches out of the run directory to a retained ciphertext.
+scenario_parent_traversal() {
+  local helper_path="$1" dir
+  dir="$(new_run "$helper_path" "run-traversal-${RANDOM}")"
+  run_helper "$helper_path" cleanup --dir "$dir" --remove ../k3s-server-token.age >"${tmp}/scenario" 2>&1 && return 1
+  grep -qF "not a run file name" "${tmp}/scenario" && [[ -f "${dir}/.recovery-run" ]] && retained_unchanged
+}
+# The directory of retained ciphertexts itself, given as the run directory.
+scenario_parent_as_run() {
+  local helper_path="$1"
+  run_helper "$helper_path" cleanup --dir "$e_home" --remove k3s-server-token.age \
+    --remove recovery-inventory.age --remove recovery-inventory.downloaded.age >"${tmp}/scenario" 2>&1 && return 1
+  grep -qF "not a run directory" "${tmp}/scenario" && retained_unchanged
+}
+for scenario in scenario_retained_copy_listed scenario_retained_copy_unlisted scenario_parent_traversal scenario_parent_as_run; do
+  if "$scenario" "$helper"; then
+    pass "cleanup: ${scenario#scenario_}: refused, nothing removed, retained ciphertexts unchanged"
+  else
+    fail "cleanup: ${scenario#scenario_}" "not refused by its guard, or a file was removed or changed"
+    sed 's/^/     | /' "${tmp}/scenario"
+  fi
+done
+
+# Mutation tests: with each guard disabled, its scenario must fail, which shows that
+# the scenario depends on that guard.
+mutant_dir="${tmp}/mutant/scripts"
+mkdir -p "$mutant_dir"
+mutant_case() {
+  local label="$1" message="$2" scenario="$3" mutant="${mutant_dir}/recovery-material.sh"
+  sed "s/|| die \"${message}/|| : \"${message}/" "$helper" >"$mutant"
+  if cmp -s -- "$helper" "$mutant"; then
+    fail "cleanup mutant: ${label}" "mutation anchor not found: ${message}"
+  elif "$scenario" "$mutant"; then
+    fail "cleanup mutant: ${label}" "the scenario passed with the guard disabled"
+  else
+    pass "cleanup mutant: ${label}: killed by ${scenario#scenario_}"
+  fi
+}
+mutant_case "no pre-run timestamp guard" "run file predates the run directory" scenario_retained_copy_listed
+mutant_case "no exact-contents guard" "unexpected entry in the run directory" scenario_retained_copy_unlisted
+mutant_case "no run-file name guard" "not a run file name" scenario_parent_traversal
+mutant_case "no run-marker guard" "not a run directory" scenario_parent_as_run
+
+# Refusals. Each must remove nothing.
+e_run="$(new_run "$helper" run-refuse k3s-server-token.age identity-archive.age)"
+refuse() {
+  local name="$1" message="$2"
+  shift 2
+  expect "cleanup: refuses ${name}" 1 "$message" -- rm_helper cleanup "$@"
+  if [[ -f "${e_run}/k3s-server-token.age" && -f "${e_run}/identity-archive.age" && -f "${e_run}/.recovery-run" ]] \
+    && retained_unchanged; then
+    pass "cleanup: nothing removed after refusing ${name}"
+  else
+    fail "cleanup: ${name}" "a file was removed despite the refusal"
+  fi
+}
+refuse "a wildcard name" "not a run file name" --dir "$e_run" --remove '*.age'
+refuse "an unrelated name" "not a run file name" --dir "$e_run" --remove notes.age
+refuse "a duplicate name" "listed more than once" --dir "$e_run" --remove k3s-server-token.age \
+  --remove k3s-server-token.age --remove identity-archive.age
+refuse "a missing run file" "does not exist or is not a regular file" --dir "$e_run" --remove k3s-server-token.age \
+  --remove identity-archive.age --remove grafana-admin.age
+refuse "a run directory with a trailing slash" "absolute, normalized path" --dir "${e_run}/" --remove k3s-server-token.age
+refuse "a run directory with a .. component" "absolute, normalized path" --dir "${e_run}/../run-refuse" \
+  --remove k3s-server-token.age
+ln -s "$e_run" "${e_home}/run-link"
+refuse "a symbolic-link run directory" "does not exist or is a symbolic link" --dir "${e_home}/run-link" \
+  --remove k3s-server-token.age --remove identity-archive.age
+rm -f -- "${e_home}/run-link"
+refuse "a run directory under a symbolic-link path" "path contains a symbolic link" --dir "${tmp}/home-link/run-refuse" \
+  --remove k3s-server-token.age --remove identity-archive.age
+refuse "a kept file inside the run directory" "must not be inside the run directory" --dir "$e_run" \
+  --remove identity-archive.age --keep "${e_run}/k3s-server-token.age"
+refuse "a missing kept file" "kept file does not exist" --dir "$e_run" --remove k3s-server-token.age \
+  --remove identity-archive.age --keep "${e_home}/grafana-admin.age"
+ln -s "${e_home}/k3s-server-token.age" "${tmp}/kept-link.age"
+refuse "a symbolic-link kept file" "or is a symbolic link" --dir "$e_run" \
+  --remove k3s-server-token.age --remove identity-archive.age --keep "${tmp}/kept-link.age"
+refuse "an unknown argument" "unknown argument" --dir "$e_run" --remove k3s-server-token.age --all yes
+mkdir "${e_run}/nested"
+refuse "an unexpected subdirectory" "unexpected entry in the run directory" --dir "$e_run" \
+  --remove k3s-server-token.age --remove identity-archive.age
+rmdir "${e_run}/nested"
+chmod 0750 "$e_run"
+refuse "a run directory that is not mode 700" "must be mode 700 and owned by you" --dir "$e_run" \
+  --remove k3s-server-token.age --remove identity-archive.age
+chmod 0700 "$e_run"
+mv "${e_run}/.recovery-run" "${tmp}/marker"
+ln -s "${tmp}/marker" "${e_run}/.recovery-run"
+expect "cleanup: refuses a symbolic-link run marker" 1 "not a run directory" -- \
+  rm_helper cleanup --dir "$e_run" --remove k3s-server-token.age --remove identity-archive.age
+rm -f -- "${e_run}/.recovery-run"
+mv "${tmp}/marker" "${e_run}/.recovery-run"
+
+# Links in a run directory that point at a retained ciphertext.
+e_links="$(new_run "$helper" run-links)"
+ln -s "${e_home}/k3s-server-token.age" "${e_links}/k3s-server-token.age"
+ln "${e_home}/recovery-inventory.age" "${e_links}/recovery-inventory.age"
+expect "cleanup: refuses a symbolic link to a retained ciphertext" 1 "run file is a symbolic link" -- \
+  rm_helper cleanup --dir "$e_links" --remove k3s-server-token.age
+expect "cleanup: refuses a hard link to a retained ciphertext" 1 "has other hard links" -- \
+  rm_helper cleanup --dir "$e_links" --remove recovery-inventory.age
+if [[ -L "${e_links}/k3s-server-token.age" && -f "${e_links}/recovery-inventory.age" ]] && retained_unchanged; then
+  pass "cleanup: links and retained ciphertexts untouched after the link refusals"
+else
+  fail "cleanup links" "a link or retained ciphertext was removed or changed"
+fi
 
 echo
 printf 'Recovery-material helper tests: %d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
