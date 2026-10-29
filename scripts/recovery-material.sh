@@ -20,6 +20,18 @@
 #       name other than ITEM.age, ITEM.downloaded.age or identity-archive.age; a
 #       missing, linked, foreign or pre-run file; and any entry not named. Never
 #       needs root, and refuses it.
+#   decrypt-inventory --inventory-dir DIR --ciphertext FILE.age --ciphertext-sha256 HEX
+#                     --identity-archive FILE.age --archive-sha256 HEX
+#       Decrypt the previous inventory, for an update, to DIR/previous-inventory.md
+#       only. DIR must be the operator's private inventory tmpfs (a mode 0700 tmpfs
+#       mount point), swap must be off and a terminal available for age's own
+#       passphrase prompt. Both inputs must be absolute, normalized, regular files
+#       with no symbolic link in their path, outside DIR. They are only read: private
+#       copies in DIR are checked against the expected SHA-256 and header (one X25519
+#       stanza; one scrypt stanza), decrypted from, and removed on exit. The result
+#       must be a nonempty, singly linked, mode 600 file that passes
+#       validate-recovery-material.py --check-inventory, or it is removed. Nothing
+#       from the plaintext is printed. Never needs root, and refuses it.
 #
 # Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
 # encryption-config is the K3s secrets-encryption configuration (Stage 3). Its
@@ -83,6 +95,12 @@ ROOT_OWNED_ITEMS=(encryption-config)
 ENCRYPTION_CONFIG_SOURCE="/var/lib/rancher/k3s/server/cred/encryption-config.json"
 # Created by start-run in each run directory; cleanup refuses a directory without it.
 RUN_MARKER=".recovery-run"
+# Fixed names in the inventory tmpfs during an update. encrypt refuses the inventory
+# while the previous plaintext or either decryption copy is still beside its source.
+PREVIOUS_PLAINTEXT="previous-inventory.md"
+PREVIOUS_COPY="previous-inventory.age"
+ARCHIVE_COPY="identity-archive.age"
+REPLACEMENT_NAME="recovery-material-inventory.md"
 TEST_ONLY_VARIABLES=(RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE RECOVERY_MATERIAL_TEST_SOURCE_OWNER RECOVERY_MATERIAL_TEST_PARENT_OWNER)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPIENT_FILE="$(cd "${script_dir}/.." && pwd)/recovery/home-cluster-recovery-recipient.txt"
@@ -311,6 +329,13 @@ cmd_encrypt() {
   parse_args "$@"
   [[ -n "$item" && -n "$src" && -n "$out" ]] || die "encrypt needs --item, --source and --out"
   require_item "$item"
+  if [[ "$item" == "recovery-inventory" ]]; then
+    local leftover
+    for leftover in "$PREVIOUS_PLAINTEXT" "$PREVIOUS_COPY" "$ARCHIVE_COPY"; do
+      [[ ! -e "$(dirname -- "$src")/${leftover}" && ! -L "$(dirname -- "$src")/${leftover}" ]] \
+        || die "remove ${leftover} from the inventory directory before encrypting the inventory"
+    done
+  fi
   [[ "$out" == *.age ]] || die "output must end in .age"
   [[ ! -e "$out" && ! -L "$out" ]] || die "output already exists: ${out}"
   require_root
@@ -594,6 +619,119 @@ cmd_cleanup() {
   printf 'result: PASS\n'
 }
 
+sha256_ok() {
+  [[ "${1,,}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# A file decrypt-inventory only reads: absolute, normalized, outside the inventory
+# directory, and a regular file with no symbolic link anywhere in its path.
+check_input_file() {
+  local label="$1" path="$2" dir="$3"
+  normalized_path "$path" || die "the ${label} path must be absolute and normalized: ${path}"
+  [[ "$path" != "${dir}/"* ]] || die "the ${label} must not be inside the inventory directory: ${path}"
+  [[ ! -L "$path" ]] || die "the ${label} is a symbolic link: ${path}"
+  [[ -f "$path" ]] || die "the ${label} does not exist or is not a regular file: ${path}"
+  [[ "$(realpath -e -- "$path")" == "$path" ]] || die "the ${label} path contains a symbolic link: ${path}"
+}
+
+decrypt_dir="" decrypt_done=0
+# Removes the private copies, and the previous plaintext unless it was decrypted and
+# checked, including on error and on INT, TERM and HUP.
+decrypt_cleanup() {
+  local status=$? failed=0 name
+  if [[ -n "$decrypt_dir" ]]; then
+    for name in "$PREVIOUS_COPY" "$ARCHIVE_COPY"; do
+      rm -f -- "${decrypt_dir}/${name}" 2>/dev/null || failed=1
+      [[ ! -e "${decrypt_dir}/${name}" ]] || failed=1
+    done
+    if (( ! decrypt_done )); then
+      rm -f -- "${decrypt_dir}/${PREVIOUS_PLAINTEXT}" 2>/dev/null || failed=1
+      [[ ! -e "${decrypt_dir}/${PREVIOUS_PLAINTEXT}" ]] || failed=1
+    fi
+  fi
+  if (( failed )); then
+    printf 'ERROR: cleanup of %s failed; remove its decryption files before continuing\n' "$decrypt_dir" >&2
+    (( status != 0 )) || status=1
+  fi
+  exit "$status"
+}
+
+cmd_decrypt_inventory() {
+  local dir="" ciphertext_in="" cipher_sum="" archive_in="" archive_sum="" name mode owner identity out
+  while (( $# )); do
+    [[ "$1" == --* && $# -ge 2 ]] || die "missing value for argument: $1"
+    case "$1" in
+      --inventory-dir) dir="$2" ;;
+      --ciphertext) ciphertext_in="$2" ;;
+      --ciphertext-sha256) cipher_sum="$2" ;;
+      --identity-archive) archive_in="$2" ;;
+      --archive-sha256) archive_sum="$2" ;;
+      *) die "unknown argument: $1" ;;
+    esac
+    shift 2
+  done
+  [[ -n "$dir" && -n "$ciphertext_in" && -n "$cipher_sum" && -n "$archive_in" && -n "$archive_sum" ]] \
+    || die "decrypt-inventory needs --inventory-dir, --ciphertext, --ciphertext-sha256, --identity-archive and --archive-sha256"
+  refuse_root
+  require_age
+  refuse_passphrase_env
+  sha256_ok "$cipher_sum" || die "--ciphertext-sha256 must be 64 hexadecimal characters"
+  sha256_ok "$archive_sum" || die "--archive-sha256 must be 64 hexadecimal characters"
+
+  normalized_path "$dir" || die "the inventory directory must be an absolute, normalized path: ${dir}"
+  [[ -d "$dir" && ! -L "$dir" ]] || die "the inventory directory does not exist or is a symbolic link: ${dir}"
+  [[ "$(realpath -e -- "$dir")" == "$dir" ]] || die "the inventory directory path contains a symbolic link: ${dir}"
+  read -r mode owner < <(stat -c '%a %u' -- "$dir")
+  [[ "$mode $owner" == "700 $(id -u)" ]] || die "the inventory directory must be mode 700 and owned by you: ${dir}"
+  if (( ! test_mode )); then
+    [[ "$(findmnt -no FSTYPE --mountpoint "$dir" 2>/dev/null)" == "tmpfs" ]] \
+      || die "the inventory directory is not a tmpfs mount point; create it as in the runbook first: ${dir}"
+    ! swap_active || die "swap is active; disable it before decrypting"
+    { : </dev/tty; } 2>/dev/null || die "no terminal is available for the passphrase prompt"
+  fi
+  for name in "$PREVIOUS_PLAINTEXT" "$PREVIOUS_COPY" "$ARCHIVE_COPY" "$REPLACEMENT_NAME"; do
+    [[ ! -e "${dir}/${name}" && ! -L "${dir}/${name}" ]] || die "already present in the inventory directory: ${dir}/${name}"
+  done
+  check_input_file "previous inventory ciphertext" "$ciphertext_in" "$dir"
+  check_input_file "identity archive" "$archive_in" "$dir"
+  if (( test_mode )); then
+    identity="${RECOVERY_MATERIAL_TEST_IDENTITY:-}"
+    [[ -f "$identity" ]] || die "test mode needs RECOVERY_MATERIAL_TEST_IDENTITY"
+  else
+    identity="${dir}/${ARCHIVE_COPY}"
+  fi
+
+  trap decrypt_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  decrypt_dir="$dir"
+  # The checks apply to the private copies that age reads; the originals are only read.
+  install -m 0600 -- "$ciphertext_in" "${dir}/${PREVIOUS_COPY}" || die "could not copy the previous inventory ciphertext"
+  [[ "$(ciphertext_sha256 "${dir}/${PREVIOUS_COPY}")" == "${cipher_sum,,}" ]] \
+    || die "the previous inventory ciphertext does not have the expected SHA-256"
+  header_ok "${dir}/${PREVIOUS_COPY}" X25519 || die "the previous inventory ciphertext header check failed"
+  install -m 0600 -- "$archive_in" "${dir}/${ARCHIVE_COPY}" || die "could not copy the identity archive"
+  [[ "$(ciphertext_sha256 "${dir}/${ARCHIVE_COPY}")" == "${archive_sum,,}" ]] \
+    || die "the identity archive does not have the expected SHA-256"
+  header_ok "${dir}/${ARCHIVE_COPY}" scrypt || die "the identity archive is not a passphrase-encrypted age file"
+
+  out="${dir}/${PREVIOUS_PLAINTEXT}"
+  age -d -i "$identity" -o "$out" -- "${dir}/${PREVIOUS_COPY}" </dev/null || die "age decryption failed"
+  [[ -f "$out" && ! -L "$out" && -s "$out" ]] || die "the decrypted previous inventory is missing, empty or not a regular file"
+  [[ "$(stat -c '%a %u %h' -- "$out")" == "600 $(id -u) 1" ]] \
+    || die "the decrypted previous inventory is not mode 600, yours and singly linked"
+  python3 "${script_dir}/validate-recovery-material.py" --check-inventory "$out" >/dev/null \
+    || die "the previous inventory failed the inventory check; it was removed"
+  decrypt_done=1
+
+  printf 'item: recovery-inventory\n'
+  printf 'previous ciphertext: PASS (expected SHA-256, regular file, no link, one X25519 stanza)\n'
+  printf 'identity archive: PASS (expected SHA-256, regular file, no link, one scrypt stanza)\n'
+  printf 'previous inventory: %s (mode 600, nonempty, inventory check PASS)\n' "$out"
+  printf 'result: PASS\n'
+}
+
 main() {
   local command="${1:-}"
   (( $# )) && shift
@@ -603,7 +741,8 @@ main() {
     verify) cmd_verify "$@" ;;
     start-run) cmd_start_run "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
-    *) die "usage: recovery-material.sh {check-recipient|encrypt|verify|start-run|cleanup} [options]" ;;
+    decrypt-inventory) cmd_decrypt_inventory "$@" ;;
+    *) die "usage: recovery-material.sh {check-recipient|encrypt|verify|start-run|cleanup|decrypt-inventory} [options]" ;;
   esac
 }
 

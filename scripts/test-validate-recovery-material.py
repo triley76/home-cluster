@@ -33,6 +33,23 @@ GATE_NO_MOVE = "do not move or copy its inventory ciphertext into `~/hc-recovery
 OFFLINE_STOP = "an offline copy is pending or unverified when the workstation run cleanup is due. This stop is mandatory"
 LOCK_STEP = "3. Lock the device (`manage-bde -lock <drive>:`)"
 OFFLINE_SOURCE = "run-<YYYY-MM-DD>\\recovery-inventory.downloaded.age'"
+# Updating an existing inventory.
+UPDATE_HEADING = "### Updating an existing inventory\n"
+UPDATE_DECRYPT = 'recovery-material.sh decrypt-inventory --inventory-dir "$inv"'
+UPDATE_KEEPALIVE = "   pgrep -fx 'sleep 14400'                         # the keep-alive (prerequisite 3) must still be running\n"
+UPDATE_SWAP = "   swapon --show                                   # must print nothing\n"
+UPDATE_TMPFS = '   findmnt -no FSTYPE --mountpoint "$inv"          # must print: tmpfs\n'
+UPDATE_TAIL = "   stat -c '%a %U' \"$inv\"                          # must print: 700 <your user>\n   umask 077\n"
+SAFE_VIM = "   vim -n -i NONE -c 'set nobackup nowritebackup noundofile' \"$inv/recovery-material-inventory.md\"\n"
+UPDATE_VALIDATE = (
+    '   python3 scripts/validate-recovery-material.py --check-inventory "$inv/recovery-material-inventory.md" \\\n'
+    "     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age\n"
+)
+UPDATE_REMOVE = '   rm -f -- "$inv/previous-inventory.md"\n'
+UPDATE_REMOVE_STEP = "5. **Remove the previous plaintext before encrypting:**"
+UPDATE_CONTINUE = "6. **Only then continue with step 3**"
+GATE_KEEP_PRIOR = 'also pass `--keep "$prior"`'
+PREVIOUS_KEY = "recovery/recovery-inventory/2026-10-29.age"
 HELPER = "scripts/recovery-material.sh"
 
 BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -168,6 +185,26 @@ CASES = {
     "runbook-partial-cleanup-allowed": (replace(RUNBOOK, GATE_PARTIAL, "remove the files unrelated to the pending copy"), "runbook-offline-gate-missing", "never-printed"),
     "runbook-move-to-retained-allowed": (replace(RUNBOOK, GATE_NO_MOVE, "move its inventory ciphertext into `~/hc-recovery`"), "runbook-offline-gate-missing", "never-printed"),
     "runbook-offline-stop-removed": (replace(RUNBOOK, OFFLINE_STOP, "an offline copy is pending"), "runbook-offline-stop-missing", "never-printed"),
+    "update-decrypt-outside-tmpfs": (replace(RUNBOOK, UPDATE_DECRYPT, 'recovery-material.sh decrypt-inventory --inventory-dir ~/hc-recovery'), "runbook-decrypt-outside-tmpfs", "never-printed"),
+    "update-decrypt-outside-section": (append(RUNBOOK, '\nbash scripts/recovery-material.sh decrypt-inventory --inventory-dir "$inv" --ciphertext "$prior"\n'), "runbook-decrypt-outside-tmpfs", "never-printed"),
+    "update-raw-age-decrypt": (append(RUNBOOK, '\nage -d -i "$archive" -o ~/previous-inventory.md -- "$prior"\n'), "runbook-decrypt-outside-tmpfs", "never-printed"),
+    "update-raw-age-long-decrypt": (append(RUNBOOK, '\nage --decrypt -i "$archive" -- "$prior" > "$inv/previous-inventory.md"\n'), "runbook-decrypt-outside-tmpfs", "never-printed"),
+    "update-keepalive-gate-removed": (replace(RUNBOOK, UPDATE_KEEPALIVE, ""), "runbook-update-gates-missing", "never-printed"),
+    "update-swap-gate-removed": (replace(RUNBOOK, UPDATE_SWAP + UPDATE_TMPFS + UPDATE_TAIL, UPDATE_TMPFS + UPDATE_TAIL), "runbook-update-gates-missing", "never-printed"),
+    "update-tmpfs-gate-removed": (replace(RUNBOOK, UPDATE_TMPFS + UPDATE_TAIL, UPDATE_TAIL), "runbook-update-gates-missing", "never-printed"),
+    "update-plaintext-cat": (append(RUNBOOK, '\ncat -- "$inv/previous-inventory.md"\n'), "runbook-plaintext-output", "never-printed"),
+    "update-plaintext-grep": (append(RUNBOOK, '\ngrep -n Bucket "$inv/recovery-material-inventory.md"\n'), "runbook-plaintext-output", "never-printed"),
+    "update-plaintext-other-editor": (append(RUNBOOK, '\nnano "$inv/previous-inventory.md"\n'), "runbook-plaintext-output", "never-printed"),
+    "update-unsafe-vim": (replace(RUNBOOK, SAFE_VIM, '   vim "$inv/recovery-material-inventory.md"\n'), "runbook-unsafe-editor", "never-printed"),
+    "update-validation-removed": (replace(RUNBOOK, UPDATE_VALIDATE, ""), "runbook-update-validation-missing", "never-printed"),
+    "update-previous-plaintext-kept": (replace(RUNBOOK, UPDATE_REMOVE, ""), "runbook-update-previous-not-removed", "never-printed"),
+    "update-encrypt-before-removal": (replace(RUNBOOK, UPDATE_REMOVE_STEP, "5. **Only then continue with step 3**; afterwards remove the previous plaintext:"), "runbook-update-previous-not-removed", "never-printed"),
+    "update-prior-overwritten": (append(RUNBOOK, '\ncp -- "$run/recovery-inventory.age" "$prior"\n'), "runbook-update-prior-unprotected", "never-printed"),
+    "update-prior-deleted": (append(RUNBOOK, '\nrm -f -- "$prior"\n'), "runbook-update-prior-unprotected", "never-printed"),
+    "update-prior-as-output": (append(RUNBOOK, '\nbash scripts/recovery-material-s3.sh download --out "$prior"\n'), "runbook-update-prior-unprotected", "never-printed"),
+    "update-prior-not-kept": (replace(RUNBOOK, GATE_KEEP_PRIOR, "also pass nothing more"), "runbook-update-prior-unprotected", "never-printed"),
+    "update-premature-run-cleanup": (replace(RUNBOOK, UPDATE_CONTINUE, 'bash scripts/recovery-material.sh cleanup --dir "$run" --keep "$prior"\n' + UPDATE_CONTINUE), "runbook-cleanup-before-offline-copies", "never-printed"),
+    "update-section-moved": (replace(RUNBOOK, UPDATE_HEADING, "## Updating an existing inventory\n"), "runbook-update-missing", "never-printed"),
     "runbook-offline-source-original": (replace(RUNBOOK, OFFLINE_SOURCE, "run-<YYYY-MM-DD>\\recovery-inventory.age'"), "runbook-offline-source", "never-printed"),
     "helper-tracing": (replace(HELPER, "set -euo pipefail\n", "set -euo pipefail\nset -x\n"), "helper-tracing", "never-printed"),
     "helper-debug-flag": (replace(HELPER, "  version=\"$(age --version", "  aws --debug >/dev/null\n  version=\"$(age --version"), "helper-debug-flag", "never-printed"),
@@ -229,6 +266,48 @@ def main() -> None:
         ok = run(base, "--scan", str(filled))
         assert ok.returncode == 0, f"metadata-only inventory rows rejected:\n{ok.stderr}"
 
+        # --check-inventory, on a synthetic filled inventory built from the template.
+        def filled_inventory(previous: str = PREVIOUS_KEY) -> str:
+            lines = []
+            for line in (base / TEMPLATE).read_text(encoding="utf-8").splitlines():
+                cells = line.strip().strip("|").split("|") if line.lstrip().startswith("|") else []
+                if len(cells) >= 2 and "<" in cells[-1]:
+                    value = previous if "Previous inventory object" in line else "filled"
+                    line = "|".join(["", *cells[:-1], f" `{value}` ", ""])
+                lines.append(line)
+            return "\n".join(lines) + "\n"
+
+        def check_inventory(text: str, *extra: str) -> subprocess.CompletedProcess[str]:
+            inventory.write_text(text, encoding="utf-8")
+            return run(base, "--check-inventory", str(inventory), *extra)
+
+        good = filled_inventory()
+        result = check_inventory(good)
+        assert result.returncode == 0 and result.stdout.strip() == "PASS", f"filled inventory rejected:\n{result.stderr}"
+        result = check_inventory(good, "--previous-key", PREVIOUS_KEY)
+        assert result.returncode == 0, f"replacement with the right previous key rejected:\n{result.stderr}"
+        template_text = (base / TEMPLATE).read_text(encoding="utf-8")
+        result = check_inventory(template_text)
+        assert result.returncode == 0, "a decrypted inventory with unfilled rows must still pass without --previous-key"
+        for text, extra, rule in (
+            (template_text, ("--previous-key", PREVIOUS_KEY), "inventory-placeholder-left"),
+            (good, ("--previous-key", "recovery/recovery-inventory/2026-10-18.age"), "inventory-previous-key-mismatch"),
+            (good, ("--previous-key", "recovery/k3s-server-token/2026-10-29.age"), "inventory-previous-key-format"),
+            (good.replace(ENC_ROW.split("|")[2], " Renamed field "), (), "inventory-row-missing"),
+            (good + f"\n{FAKE_SECRET_KEY}\n", (), "age-secret-key"),
+            (good + f"\n| Account | {FAKE_ACCOUNT} |\n", (), "aws-account-id"),
+        ):
+            result = check_inventory(text, *extra)
+            assert result.returncode == 1 and f": {rule}\n" in result.stderr, f"--check-inventory missed {rule}:\n{result.stderr}"
+            for value in ("filled", FAKE_SECRET_KEY, FAKE_ACCOUNT, PREVIOUS_KEY):
+                assert value not in result.stdout + result.stderr, f"--check-inventory printed a value for {rule}"
+        link = Path(temp, "inventory-link.md")
+        link.symlink_to(inventory)
+        result = run(base, "--check-inventory", str(link))
+        assert result.returncode == 1 and ": inventory-not-regular-file\n" in result.stderr, "--check-inventory followed a link"
+        result = run(base, "--previous-key", PREVIOUS_KEY)
+        assert result.returncode == 1 and "needs --check-inventory" in result.stderr, "--previous-key accepted alone"
+
     for name, (mutate, rule, value) in CASES.items():
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -261,7 +340,7 @@ def main() -> None:
     if failures:
         print("\n".join(failures), file=sys.stderr)
         sys.exit(1)
-    print(f"Recovery-material scanner mutation tests passed: {len(CASES)} cases, plus recipient, --scan, filled-inventory and force-add checks")
+    print(f"Recovery-material scanner mutation tests passed: {len(CASES)} cases, plus recipient, --scan, filled-inventory, --check-inventory and force-add checks")
 
 
 if __name__ == "__main__":
