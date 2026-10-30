@@ -8,8 +8,11 @@
 #       Encrypt FILE directly with the committed recipient. Prints the ciphertext
 #       path, size and SHA-256.
 #   verify --item ITEM --ciphertext FILE.age --source FILE --identity-archive FILE.age
+#          [--ciphertext-sha256 HEX]
 #       Decrypt a downloaded ciphertext into a private tmpfs and compare it with the
 #       source using cmp -s. Prints MATCH, DIFFER or ERROR and the cmp exit status.
+#       With --ciphertext-sha256 (required for stage3-p2-snapshot), the ciphertext
+#       must have that SHA-256 before anything is decrypted.
 #   start-run --dir DIR
 #       Create DIR (mode 0700, which must not exist) as this run's directory, with a
 #       run marker. Every file a run creates or transports on this host goes in it.
@@ -33,18 +36,39 @@
 #       validate-recovery-material.py --check-inventory, or it is removed. Nothing
 #       from the plaintext is printed. Never needs root, and refuses it.
 #
-# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
+# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config,
+# stage3-p2-snapshot.
 # encryption-config is the K3s secrets-encryption configuration (Stage 3). Its
 # --source must be exactly /var/lib/rancher/k3s/server/cred/encryption-config.json:
 # no other path, alias or symbolic-link component, with a canonical path equal to
 # it. The file must be owned by root:root, and its directory must be a real
 # directory owned by root:root and not writable by group or others.
 #
+# stage3-p2-snapshot is the interim, manually preserved copy of the Stage 3 p2
+# (post-encryption) etcd snapshot. It is not a Stage 4 upload: those are K3s's own
+# uploads under etcd/. Its --source must be:
+#   - directly in /var/lib/rancher/k3s/server/db/snapshots, a root:root directory
+#     that group and others cannot write to, with no symbolic link in its path;
+#   - named stage3-p2-post-encryption-<YYYYMMDD>t<HHMMSS>z-k3s01-<epoch>;
+#   - a regular root:root file, mode 600, singly linked, at most 64 MiB, whose
+#     canonical path is itself;
+#   - the only p2-post-encryption record in the Stage 3 checkpoints file
+#     (/var/lib/homelab-secrets-encryption/checkpoints, root:root, no group or other
+#     access, in a root:root directory), with the same name, size, modification time
+#     and SHA-256. The snapshot digest is compared with that record and never printed.
+# encrypt checks the source again after encryption and removes the ciphertext if it
+# changed. It must run through sudo from the operator's own (non-root) account, so
+# that the ciphertext is created by the operator. verify needs --ciphertext-sha256
+# and uses an 80 MiB private tmpfs, after checking that twice that much memory is
+# available.
+#
 # Production runs as root (through sudo). The helper never prints plaintext,
 # plaintext sizes or plaintext hashes; age reads the source file itself.
 # encrypt creates the output exclusively (it never overwrites or follows an existing
 # path), and under sudo writes it as the invoking user, so root never writes into the
-# operator's directory. verify:
+# operator's directory. It then requires the output to be a regular, singly linked,
+# mode 600 file owned by the operator (the sudo user, or the caller without sudo), and
+# otherwise removes it. verify:
 #   - refuses to run while any swap device is active, because tmpfs pages can be
 #     written to swap;
 #   - mounts its own root-owned 0700 tmpfs, verifies the mount, and on exit removes
@@ -65,10 +89,17 @@
 #   - the required root:root owner of the file and of its directory, with
 #     RECOVERY_MATERIAL_TEST_SOURCE_OWNER and RECOVERY_MATERIAL_TEST_PARENT_OWNER
 #     (uid:gid, default the test user's own).
+# For stage3-p2-snapshot, the same owner variables apply, and also:
+#   - RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR and RECOVERY_MATERIAL_TEST_CHECKPOINTS
+#     replace the snapshot directory and the checkpoints file (absolute, normalized);
+#   - RECOVERY_MATERIAL_TEST_SUDO_USER and RECOVERY_MATERIAL_TEST_SUDO_UID stand in
+#     for SUDO_USER and SUDO_UID, so that encrypt writes through the runuser found on
+#     PATH (a stub in the tests);
+#   - RECOVERY_MATERIAL_TEST_MEMINFO replaces /proc/meminfo for the memory check.
 # These variables are refused outright outside test mode, so they can never
 # override a production source path or owner.
-# Test mode does NOT exercise sudo, runuser, the tmpfs mount, the swap check, the
-# passphrase prompt, SSH, AWS or S3.
+# Test mode does NOT exercise sudo, the real runuser, the tmpfs mount, the swap
+# check, the passphrase prompt, SSH, AWS or S3.
 #
 # Requires: bash, age v1.3.2, coreutils, util-linux (mount, umount, findmnt, runuser).
 set -euo pipefail
@@ -88,11 +119,21 @@ unset HISTFILE
 set +o history 2>/dev/null || true
 
 AGE_VERSION_REQUIRED="v1.3.2"
-ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config)
+ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config stage3-p2-snapshot)
 # Items whose source must be owned by root:root (uid 0, gid 0).
-ROOT_OWNED_ITEMS=(encryption-config)
+ROOT_OWNED_ITEMS=(encryption-config stage3-p2-snapshot)
 # The only production source of encryption-config.
 ENCRYPTION_CONFIG_SOURCE="/var/lib/rancher/k3s/server/cred/encryption-config.json"
+# stage3-p2-snapshot: the K3s snapshot directory, the Stage 3 checkpoints file, the
+# p2 snapshot name and checkpoint label, the size cap, and verify's tmpfs size (the
+# cap plus room for the identity archive; the other items use 4 MiB).
+SNAPSHOT_DIR="/var/lib/rancher/k3s/server/db/snapshots"
+CHECKPOINTS_FILE="/var/lib/homelab-secrets-encryption/checkpoints"
+SNAPSHOT_NAME_RE='^stage3-p2-post-encryption-[0-9]{8}t[0-9]{6}z-k3s01-[0-9]{10}$'
+SNAPSHOT_LABEL="p2-post-encryption"
+SNAPSHOT_MAX_BYTES=$(( 64 * 1024 * 1024 ))
+SNAPSHOT_TMPFS_MIB=80
+SMALL_TMPFS_MIB=4
 # Created by start-run in each run directory; cleanup refuses a directory without it.
 RUN_MARKER=".recovery-run"
 # Fixed names in the inventory tmpfs during an update. encrypt refuses the inventory
@@ -101,7 +142,9 @@ PREVIOUS_PLAINTEXT="previous-inventory.md"
 PREVIOUS_COPY="previous-inventory.age"
 ARCHIVE_COPY="identity-archive.age"
 REPLACEMENT_NAME="recovery-material-inventory.md"
-TEST_ONLY_VARIABLES=(RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE RECOVERY_MATERIAL_TEST_SOURCE_OWNER RECOVERY_MATERIAL_TEST_PARENT_OWNER)
+TEST_ONLY_VARIABLES=(RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE RECOVERY_MATERIAL_TEST_SOURCE_OWNER RECOVERY_MATERIAL_TEST_PARENT_OWNER
+  RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR RECOVERY_MATERIAL_TEST_CHECKPOINTS RECOVERY_MATERIAL_TEST_SUDO_USER
+  RECOVERY_MATERIAL_TEST_SUDO_UID RECOVERY_MATERIAL_TEST_MEMINFO)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPIENT_FILE="$(cd "${script_dir}/.." && pwd)/recovery/home-cluster-recovery-recipient.txt"
 
@@ -210,28 +253,102 @@ expected_source() {
   printf '%s' "$expected"
 }
 
-# encryption-config only, before any other source check: the path must be exactly
-# the expected one, no component of its directory may be a symbolic link, and the
-# directory must be a root:root directory that group and others cannot write to.
-# Metadata only.
-check_bound_source() {
-  local src="$1" expected parent prefix="" part mode owner
+# A test-only path override (absolute, normalized), or the production default.
+test_path() {
+  local name="$1" default="$2" value
+  value="${!name:-}"
+  if (( test_mode )) && [[ -n "$value" ]]; then
+    [[ "$value" =~ ^(/[^/]+)+$ && "${value}/" != */./* && "${value}/" != */../* ]] \
+      || die "${name} must be an absolute, normalized path"
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+snapshot_dir() { test_path RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR "$SNAPSHOT_DIR"; }
+checkpoints_file() { test_path RECOVERY_MATERIAL_TEST_CHECKPOINTS "$CHECKPOINTS_FILE"; }
+
+# A directory that a bound source or record lies in: no component of its path is a
+# symbolic link, and it is a root:root directory that group and others cannot write
+# to. Metadata only.
+check_trusted_dir() {
+  local label="$1" dir="$2" prefix="" part mode owner
   local -a parts
-  expected="$(expected_source)"
-  [[ "$src" == "$expected" ]] || die "the encryption-config source must be exactly ${expected}"
-  parent="${expected%/*}"
-  IFS='/' read -r -a parts <<<"${parent#/}"
+  IFS='/' read -r -a parts <<<"${dir#/}"
   for part in "${parts[@]}"; do
     prefix+="/${part}"
     [[ ! -L "$prefix" ]] || die "a directory in the source path is a symbolic link: ${prefix}"
   done
-  [[ -e "$parent" ]] || die "the credential directory does not exist: ${parent}"
-  [[ -d "$parent" ]] || die "the credential directory is not a directory: ${parent}"
-  read -r mode owner < <(stat -c '%a %u:%g' -- "$parent")
+  [[ -e "$dir" ]] || die "the ${label} does not exist: ${dir}"
+  [[ -d "$dir" ]] || die "the ${label} is not a directory: ${dir}"
+  read -r mode owner < <(stat -c '%a %u:%g' -- "$dir")
   [[ "$owner" == "$(required_parent_owner)" ]] \
-    || die "the credential directory is not owned by root:root (owner ${owner}): ${parent}"
+    || die "the ${label} is not owned by root:root (owner ${owner}): ${dir}"
   (( (8#${mode} & 8#022) == 0 )) \
-    || die "the credential directory is writable by group or others (mode ${mode}): ${parent}"
+    || die "the ${label} is writable by group or others (mode ${mode}): ${dir}"
+}
+
+# encryption-config only, before any other source check: the path must be exactly
+# the expected one, in a trusted credential directory. Metadata only.
+check_bound_source() {
+  local src="$1" expected
+  expected="$(expected_source)"
+  [[ "$src" == "$expected" ]] || die "the encryption-config source must be exactly ${expected}"
+  check_trusted_dir "credential directory" "${expected%/*}"
+}
+
+# stage3-p2-snapshot only, before any other source check: an absolute, normalized
+# path directly in the trusted snapshot directory, with a p2 snapshot name.
+check_snapshot_source() {
+  local src="$1" dir
+  dir="$(snapshot_dir)"
+  normalized_path "$src" || die "the stage3-p2-snapshot source must be an absolute, normalized path: ${src}"
+  [[ "${src%/*}" == "$dir" ]] || die "the stage3-p2-snapshot source must be directly in ${dir}: ${src}"
+  [[ "${src##*/}" =~ $SNAPSHOT_NAME_RE ]] \
+    || die "the stage3-p2-snapshot source is not named as a p2 post-encryption snapshot: ${src}"
+  check_trusted_dir "snapshot directory" "$dir"
+}
+
+# The only digest of a source the helpers compute: the p2 snapshot's SHA-256, compared
+# with the value already recorded in the Stage 3 checkpoints file. Only the exit
+# status leaves this function; the digest is never printed or stored.
+snapshot_digest_matches() {
+  [[ "$(sha256sum -- "$1" | cut -d' ' -f1)" == "$2" ]]
+}
+
+# stage3-p2-snapshot only: the source must be the single p2 record in the Stage 3
+# checkpoints file ("<mtime> <label> <name> <size> <sha256> token=present"), with the
+# same name, size, modification time and SHA-256. The file holds snapshot metadata
+# only; nothing from it is printed. Sets recorded_sha256 for the post-encryption check.
+check_checkpoint() {
+  local src="$1" file mode owner links count labelled
+  local -a fields
+  file="$(checkpoints_file)"
+  check_trusted_dir "checkpoint directory" "${file%/*}"
+  [[ ! -L "$file" ]] || die "the checkpoints file is a symbolic link: ${file}"
+  [[ -f "$file" ]] || die "the checkpoints file does not exist or is not a regular file: ${file}"
+  read -r mode owner links < <(stat -c '%a %u:%g %h' -- "$file")
+  [[ "$owner" == "$(required_owner)" ]] || die "the checkpoints file is not owned by root:root (owner ${owner}): ${file}"
+  (( (8#${mode} & 8#077) == 0 )) || die "the checkpoints file is accessible to group or others (mode ${mode}): ${file}"
+  [[ "$links" == "1" ]] || die "the checkpoints file has other hard links: ${file}"
+  count="$(awk -v name="${src##*/}" '$3 == name' "$file" | wc -l)"
+  [[ "$count" -eq 1 ]] || die "the checkpoints file must hold exactly one record for the source (found ${count})"
+  labelled="$(awk -v label="$SNAPSHOT_LABEL" '$2 == label' "$file" | wc -l)"
+  [[ "$labelled" -eq 1 ]] || die "the checkpoints file must hold exactly one ${SNAPSHOT_LABEL} record (found ${labelled})"
+  read -r -a fields < <(awk -v name="${src##*/}" '$3 == name' "$file")
+  [[ "${#fields[@]}" -eq 6 && "${fields[0]}" =~ ^[0-9]+$ && "${fields[1]}" == "$SNAPSHOT_LABEL" \
+    && "${fields[3]}" =~ ^[0-9]+$ && "${fields[4]}" =~ ^[0-9a-f]{64}$ && "${fields[5]}" == "token=present" ]] \
+    || die "the checkpoint record for the source is malformed or is not the ${SNAPSHOT_LABEL} record"
+  [[ "$(stat -c '%s' -- "$src")" == "${fields[3]}" ]] || die "the source size differs from its checkpoint record"
+  [[ "$(stat -c '%Y' -- "$src")" == "${fields[0]}" ]] || die "the source modification time differs from its checkpoint record"
+  snapshot_digest_matches "$src" "${fields[4]}" || die "the source SHA-256 differs from its checkpoint record"
+  recorded_sha256="${fields[4]}"
+}
+
+# Identity of the source file, compared before and after encryption. Never printed.
+source_fingerprint() {
+  stat -c '%d:%i %h %s %Y %Z' -- "$1"
 }
 
 # After the file checks: the canonical path of the existing file is the expected path.
@@ -242,12 +359,15 @@ check_canonical_source() {
     || die "the source path does not resolve to the expected path: ${src}"
 }
 
-# Metadata only (lstat and stat); the content is never read. Sets source_report, a
-# line that is safe to print.
+# Metadata only (lstat and stat), except that a stage3-p2-snapshot source is also
+# read once for the status-only comparison with its checkpoint SHA-256. Sets
+# source_report, a line that is safe to print.
 check_source() {
-  local item="$1" src="$2" mode owner
+  local item="$1" src="$2" mode owner links size
   if [[ "$item" == "encryption-config" ]]; then
     check_bound_source "$src"
+  elif [[ "$item" == "stage3-p2-snapshot" ]]; then
+    check_snapshot_source "$src"
   fi
   [[ -e "$src" || -L "$src" ]] || die "source does not exist: ${src}"
   [[ ! -L "$src" ]] || die "source is a symbolic link: ${src}"
@@ -265,30 +385,76 @@ check_source() {
   if [[ "$item" == "encryption-config" ]]; then
     check_canonical_source "$src"
     source_report+=", expected path, directory root:root and not group or other writable"
+  elif [[ "$item" == "stage3-p2-snapshot" ]]; then
+    read -r links size < <(stat -c '%h %s' -- "$src")
+    [[ "$mode" == "600" ]] || die "the stage3-p2-snapshot source must be mode 600 (mode ${mode}): ${src}"
+    [[ "$links" == "1" ]] || die "the stage3-p2-snapshot source has other hard links: ${src}"
+    (( size <= SNAPSHOT_MAX_BYTES )) || die "the stage3-p2-snapshot source exceeds the 64 MiB cap: ${src}"
+    [[ "$(realpath -e -- "$src" 2>/dev/null)" == "$src" ]] \
+      || die "the source path does not resolve to itself: ${src}"
+    check_checkpoint "$src"
+    source_report+=", single link, within the 64 MiB cap, snapshot directory root:root and not group or other writable"
+    source_report+=", the only ${SNAPSHOT_LABEL} checkpoint record with matching name, size, time and SHA-256"
   fi
   source_report+=")"
+}
+
+# The account that called sudo, if it is not root; empty otherwise. In test mode,
+# RECOVERY_MATERIAL_TEST_SUDO_USER and RECOVERY_MATERIAL_TEST_SUDO_UID stand in for
+# SUDO_USER and SUDO_UID.
+sudo_user() {
+  local user
+  if (( test_mode )); then user="${RECOVERY_MATERIAL_TEST_SUDO_USER:-}"; else user="${SUDO_USER:-}"; fi
+  [[ "$user" == "root" ]] && user=""
+  printf '%s' "$user"
+}
+
+# The operator's uid: the sudo user's, or the caller's own without sudo.
+operator_uid() {
+  if [[ -z "$(sudo_user)" ]]; then
+    id -u
+  elif (( test_mode )); then
+    printf '%s' "${RECOVERY_MATERIAL_TEST_SUDO_UID:-}"
+  else
+    printf '%s' "${SUDO_UID:-}"
+  fi
+}
+
+# stage3-p2-snapshot is encrypted through sudo from the operator's own account, so
+# that the operator, not root, creates the ciphertext that is copied and cleaned up.
+require_sudo_operator() {
+  [[ -n "$(sudo_user)" && "$(operator_uid)" =~ ^[1-9][0-9]*$ ]] \
+    || die "${1} must be encrypted through sudo from the operator's own (non-root) account"
 }
 
 # The output directory must be a real directory owned by the operator (or root) and
 # not writable by group or others.
 check_out_dir() {
-  local dir="$1" owner mode operator
+  local dir="$1" owner mode
   [[ -d "$dir" && ! -L "$dir" ]] || die "output directory does not exist or is a symbolic link: ${dir}"
   read -r owner mode < <(stat -c '%u %a' -- "$dir")
-  operator="$(id -u)"
-  if (( ! test_mode )) && [[ -n "${SUDO_UID:-}" ]]; then
-    operator="$SUDO_UID"
-  fi
-  [[ "$owner" == "$operator" || "$owner" == "0" ]] || die "output directory is not owned by the operator: ${dir}"
+  [[ "$owner" == "$(operator_uid)" || "$owner" == "0" ]] || die "output directory is not owned by the operator: ${dir}"
   (( (8#${mode} & 8#022) == 0 )) || die "output directory is writable by group or others (mode ${mode}): ${dir}"
+}
+
+# The written ciphertext must be a regular, singly linked, mode 600 file owned by the
+# operator; otherwise the name this run created is removed.
+check_output() {
+  local out="$1"
+  if [[ -f "$out" && ! -L "$out" && "$(stat -c '%u %a %h' -- "$out")" == "$(operator_uid) 600 1" ]]; then
+    return 0
+  fi
+  [[ -f "$out" && ! -L "$out" ]] && rm -f -- "$out"
+  die "the ciphertext is not a regular, singly linked, mode 600 file owned by the operator; it was removed"
 }
 
 ciphertext_sha256() {
   sha256sum -- "$1" | cut -d' ' -f1
 }
 
+recorded_sha256=""
 parse_args() {
-  item="" src="" out="" ciphertext="" archive=""
+  item="" src="" out="" ciphertext="" archive="" expected_sha256=""
   while (( $# )); do
     [[ "$1" == --* && $# -ge 2 ]] || die "missing value for argument: $1"
     case "$1" in
@@ -297,6 +463,7 @@ parse_args() {
       --out) out="$2" ;;
       --ciphertext) ciphertext="$2" ;;
       --identity-archive) archive="$2" ;;
+      --ciphertext-sha256) expected_sha256="$2" ;;
       *) die "unknown argument: $1" ;;
     esac
     shift 2
@@ -315,11 +482,12 @@ cmd_check_recipient() {
 # Writes standard input to $1, creating it exclusively (O_EXCL through noclobber).
 # Under sudo, the file is created by the invoking user, not by root.
 write_exclusive() {
-  local target="$1"
-  if (( ! test_mode )) && [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  local target="$1" user
+  user="$(sudo_user)"
+  if [[ -n "$user" ]]; then
     # $1 is expanded by the child shell, which receives "$target" as its first argument.
     # shellcheck disable=SC2016
-    runuser -u "$SUDO_USER" -- bash -c 'umask 077; set -C; exec cat >"$1"' write_exclusive "$target"
+    runuser -u "$user" -- bash -c 'umask 077; set -C; exec cat >"$1"' write_exclusive "$target"
   else
     (set -C; exec cat >"$target")
   fi
@@ -339,21 +507,31 @@ cmd_encrypt() {
   [[ "$out" == *.age ]] || die "output must end in .age"
   [[ ! -e "$out" && ! -L "$out" ]] || die "output already exists: ${out}"
   require_root
+  [[ "$item" != "stage3-p2-snapshot" ]] || require_sudo_operator "$item"
   check_out_dir "$(dirname -- "$out")"
   require_age
   recipient_ok "$RECIPIENT_FILE" || die "the committed recipient failed validation"
   check_source "$item" "$src"
 
-  local status=0
+  local status=0 before
+  before="$(source_fingerprint "$src")"
   age -R "$RECIPIENT_FILE" -- "$src" </dev/null | write_exclusive "$out" || status=$?
   if (( status != 0 )); then
     # Remove only a regular file this run may have created; never follow a link.
     [[ -f "$out" && ! -L "$out" ]] && rm -f -- "$out"
     die "age encryption or the exclusive write failed"
   fi
+  check_output "$out"
   if ! header_ok "$out" X25519; then
     rm -f -- "$out"
     die "the ciphertext header check failed"
+  fi
+  # The snapshot must still be the checkpointed file that age read.
+  if [[ "$item" == "stage3-p2-snapshot" ]]; then
+    if [[ "$(source_fingerprint "$src")" != "$before" ]] || ! snapshot_digest_matches "$src" "$recorded_sha256"; then
+      rm -f -- "$out"
+      die "the source changed during encryption; the ciphertext was removed"
+    fi
   fi
 
   printf 'item: %s\n' "$item"
@@ -395,8 +573,29 @@ swap_active() {
   (( $(wc -l < /proc/swaps) > 1 ))
 }
 
+# verify's private tmpfs size in MiB: room for the snapshot cap and the identity
+# archive for stage3-p2-snapshot, 4 MiB for the small items.
+tmpfs_mib() {
+  if [[ "$1" == "stage3-p2-snapshot" ]]; then
+    printf '%s' "$SNAPSHOT_TMPFS_MIB"
+  else
+    printf '%s' "$SMALL_TMPFS_MIB"
+  fi
+}
+
+# Requires MemAvailable to be at least twice the tmpfs size, so that filling the
+# tmpfs cannot push the host into memory pressure.
+check_memory() {
+  local mib="$1" meminfo available
+  meminfo="$(test_path RECOVERY_MATERIAL_TEST_MEMINFO /proc/meminfo)"
+  available="$(awk '$1 == "MemAvailable:" { print $2 }' "$meminfo" 2>/dev/null)" || available=""
+  [[ "$available" =~ ^[0-9]+$ ]] || die "could not read MemAvailable"
+  (( available >= mib * 1024 * 2 )) \
+    || die "not enough available memory for the ${mib} MiB private tmpfs (twice its size is required)"
+}
+
 mount_private_tmpfs() {
-  local sources
+  local mib="$1" sources
   # Captured first: with pipefail, `findmnt | grep -q` can fail on SIGPIPE.
   sources="$(findmnt -rn -t tmpfs -o SOURCE)" || die "could not list tmpfs mounts"
   if grep -qx 'recovery-material' <<<"$sources"; then
@@ -404,7 +603,7 @@ mount_private_tmpfs() {
   fi
   work="$(mktemp -d /run/recovery-material.XXXXXX)" || die "could not create the mount point"
   production_dir=1
-  mount -t tmpfs -o size=4m,mode=0700,uid=0,gid=0,noexec,nosuid,nodev recovery-material "$work" \
+  mount -t tmpfs -o "size=${mib}m,mode=0700,uid=0,gid=0,noexec,nosuid,nodev" recovery-material "$work" \
     || die "could not mount the private tmpfs"
   mounted=1
   [[ "$(findmnt -no FSTYPE --mountpoint "$work")" == "tmpfs" ]] \
@@ -425,11 +624,22 @@ cmd_verify() {
   parse_args "$@"
   [[ -n "$item" && -n "$ciphertext" && -n "$src" ]] || die "verify needs --item, --ciphertext and --source"
   require_item "$item"
+  if [[ "$item" == "stage3-p2-snapshot" && -z "$expected_sha256" ]]; then
+    die "${item} verify needs --ciphertext-sha256, the SHA-256 that encrypt printed"
+  fi
   require_root
   require_age
   refuse_passphrase_env
   header_ok "$ciphertext" X25519 || die "the ciphertext header check failed"
+  if [[ -n "$expected_sha256" ]]; then
+    sha256_ok "$expected_sha256" || die "--ciphertext-sha256 must be 64 hexadecimal characters"
+    [[ "$(ciphertext_sha256 "$ciphertext")" == "${expected_sha256,,}" ]] \
+      || die "the ciphertext does not have the expected SHA-256 (incomplete or different transfer); nothing was decrypted"
+  fi
   check_source "$item" "$src"
+  local mib
+  mib="$(tmpfs_mib "$item")"
+  check_memory "$mib"
 
   local identity
   if [[ -n "$archive" ]]; then
@@ -452,7 +662,7 @@ cmd_verify() {
   if (( test_mode )); then
     use_test_tmpdir
   else
-    mount_private_tmpfs
+    mount_private_tmpfs "$mib"
     install -m 0600 -- "$archive" "${work}/identity-archive.age"
     identity="${work}/identity-archive.age"
   fi
@@ -479,6 +689,7 @@ cmd_verify() {
   printf 'item: %s\n' "$item"
   printf 'source check: %s\n' "$source_report"
   printf 'ciphertext sha256: %s\n' "$(ciphertext_sha256 "$ciphertext")"
+  printf 'private tmpfs: %s MiB\n' "$mib"
   printf 'cmp -s exit status: %s\n' "$rc"
   printf 'result: %s\n' "$result"
   [[ "$rc" -eq 0 ]]

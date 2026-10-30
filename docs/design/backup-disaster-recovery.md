@@ -372,6 +372,12 @@ The intended outcome is that every server uploads its own snapshots, so the buck
 
 A restore from S3 directly through K3s's S3 options is also possible. It needs the etcd identity's `s3:GetObject`, and is tested in the rehearsal.
 
+**Interim manual p2 copy (before Stage 4).** Until Stage 4 uploads exist, the Stage 3 p2 (post-encryption) snapshot may be preserved once by hand as `age` ciphertext at `recovery/stage3-p2-snapshot/<YYYY-MM-DD>.age`, using the routine role ([runbook](../runbooks/encrypted-recovery-material.md#the-interim-manual-p2-snapshot-copy-stage3-p2-snapshot)). This is a deliberate exception to the prefix map: the snapshot goes under `recovery/`, where the routine role can write and current versions never expire, not under `etcd/`, which only the etcd machine identity writes.
+- **It is not a Stage 4 upload**, and does not test K3s's naming, pruning or retention.
+- **It is recorded separately** in the recovery-material inventory, not as a Stage 4 restore point.
+- **It is superseded** once a Stage 4 upload of a later snapshot is verified.
+- **Restoring from it** follows the outline above, with the snapshot downloaded from `recovery/` and decrypted first. That path has not been rehearsed.
+
 ## Secrets encryption at rest (prerequisite stage)
 
 **Recommendation: enable and rotate K3s secrets encryption as its own stage (Stage 3), before any etcd snapshot is uploaded.**

@@ -43,13 +43,29 @@ UPDATE_TAIL = "   stat -c '%a %U' \"$inv\"                          # must print
 SAFE_VIM = "   vim -n -i NONE -c 'set nobackup nowritebackup noundofile' \"$inv/recovery-material-inventory.md\"\n"
 UPDATE_VALIDATE = (
     '   python3 scripts/validate-recovery-material.py --check-inventory "$inv/recovery-material-inventory.md" \\\n'
-    "     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age\n"
+    "     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age \\\n"
+    "     --previous-sha256 <recorded previous inventory ciphertext SHA-256>\n"
 )
+UPDATE_PREVIOUS_SHA = (
+    "     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age \\\n"
+    "     --previous-sha256 <recorded previous inventory ciphertext SHA-256>\n"
+)
+# Recovery A and B: a new, timestamped name, created with CreateNew.
+OFFLINE_DESTINATION = "recovery-inventory-<YYYY-MM-DD>-<YYYYMMDDTHHMMSSZ>.age'"
+OFFLINE_CREATE = "     $out = [IO.File]::Open($dst, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)\n"
+# The interim manual p2 snapshot copy.
+P2_SECTION = "## The interim manual p2 snapshot copy (stage3-p2-snapshot)\n"
+P2_NOT_STAGE4 = "**It is not a Stage 4 upload.**"
+P2_ROW = "| Interim manual p2 snapshot copy | Source check | "
+PREVIOUS_SHA_ROW = "| Previous inventory ciphertext SHA-256 | `<ciphertext SHA-256 of the inventory version being replaced, or none>` |\n"
+SNAPSHOT_DIGEST_BODY = "  [[ \"$(sha256sum -- \"$1\" | cut -d' ' -f1)\" == \"$2\" ]]\n"
+S3_HELPER = "scripts/recovery-material-s3.sh"
 UPDATE_REMOVE = '   rm -f -- "$inv/previous-inventory.md"\n'
 UPDATE_REMOVE_STEP = "5. **Remove the previous plaintext before encrypting:**"
 UPDATE_CONTINUE = "6. **Only then continue with step 3**"
 GATE_KEEP_PRIOR = 'also pass `--keep "$prior"`'
 PREVIOUS_KEY = "recovery/recovery-inventory/2026-10-29.age"
+PREVIOUS_SHA = "c3" * 32
 HELPER = "scripts/recovery-material.sh"
 
 BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -210,6 +226,31 @@ CASES = {
     "helper-debug-flag": (replace(HELPER, "  version=\"$(age --version", "  aws --debug >/dev/null\n  version=\"$(age --version"), "helper-debug-flag", "never-printed"),
     "helper-plaintext-digest": (replace(HELPER, "  rm -f -- \"${work}/plain\"\n\n", "  sha256sum -- \"${work}/plain\"\n  rm -f -- \"${work}/plain\"\n\n"), "helper-plaintext-digest", "never-printed"),
     "helper-plaintext-output": (replace(HELPER, "  rm -f -- \"${work}/plain\"\n\n", "  cat -- \"${work}/plain\"\n  rm -f -- \"${work}/plain\"\n\n"), "helper-plaintext-output", "never-printed"),
+    # A digest command outside the allowlisted functions, in either helper.
+    "helper-digest-outside-allowlist": (replace(HELPER, "check_output() {\n", "check_output() {\n  sha256sum -- \"$1\" >/dev/null\n"), "helper-digest-outside-allowlist", "never-printed"),
+    "helper-digest-of-snapshot-elsewhere": (replace(HELPER, "source_fingerprint() {\n", "source_fingerprint() {\n  b2sum -- \"$1\" >/dev/null\n"), "helper-digest-outside-allowlist", "never-printed"),
+    "s3-helper-digest-outside-allowlist": (replace(S3_HELPER, "current_checksum() {\n", "current_checksum() {\n  md5sum -- \"$file\" >/dev/null\n"), "helper-digest-outside-allowlist", "never-printed"),
+    # The p2 snapshot comparison must stay a status-only comparison.
+    "helper-snapshot-digest-printed": (replace(HELPER, SNAPSHOT_DIGEST_BODY, "  sha256sum -- \"$1\" >&2\n" + SNAPSHOT_DIGEST_BODY), "helper-snapshot-digest-changed", "never-printed"),
+    "helper-snapshot-digest-stored": (replace(HELPER, SNAPSHOT_DIGEST_BODY, "  snapshot_sha=\"$(sha256sum -- \"$1\" | cut -d' ' -f1)\"; [[ \"$snapshot_sha\" == \"$2\" ]]\n"), "helper-snapshot-digest-changed", "never-printed"),
+    "helper-snapshot-digest-renamed": (replace(HELPER, "snapshot_digest_matches() {\n", "snapshot_digest() {\n"), "helper-snapshot-digest-changed", "never-printed"),
+    # Inventory template rows added for replacements.
+    "template-p2-row-missing": (replace(TEMPLATE, P2_ROW, "| Interim manual p2 snapshot copy | Renamed check | "), "inventory-template-row-missing", "never-printed"),
+    "template-previous-sha-row-missing": (replace(TEMPLATE, PREVIOUS_SHA_ROW, ""), "inventory-template-row-missing", "never-printed"),
+    "template-p2-snapshot-hash-field": (append(TEMPLATE, "| Interim manual p2 snapshot copy | Plaintext SHA-256 | `<hash>` |\n"), "inventory-template-forbidden-field", "never-printed"),
+    "template-p2-snapshot-size-field": (append(TEMPLATE, "| Interim manual p2 snapshot copy | Plain size | `<bytes>` |\n"), "inventory-template-forbidden-field", "never-printed"),
+    "template-p2-filled-value": (replace(TEMPLATE, "`<recovery/stage3-p2-snapshot/YYYY-MM-DD.age, or not made>`", "`recovery/stage3-p2-snapshot/2026-10-29.age`"), "inventory-template-value", "never-printed"),
+    # Recovery A and B: never overwrite or reuse a name.
+    "runbook-offline-copy-item": (replace(RUNBOOK, OFFLINE_CREATE, "     Copy-Item -LiteralPath $src -Destination $dst\n"), "runbook-offline-overwrite", "never-printed"),
+    "runbook-offline-copy-item-force": (replace(RUNBOOK, OFFLINE_CREATE, OFFLINE_CREATE + "     Copy-Item -Force -LiteralPath $src -Destination $dst\n"), "runbook-offline-overwrite", "never-printed"),
+    "runbook-offline-create-mode": (replace(RUNBOOK, "[IO.FileMode]::CreateNew", "[IO.FileMode]::Create"), "runbook-offline-overwrite", "never-printed"),
+    "runbook-offline-untimestamped-name": (replace(RUNBOOK, OFFLINE_DESTINATION, "recovery-inventory-<YYYY-MM-DD>.age'"), "runbook-offline-destination", "never-printed"),
+    # Same-date updates are identified by the previous ciphertext SHA-256 too.
+    "update-previous-sha-removed": (replace(RUNBOOK, UPDATE_PREVIOUS_SHA, "     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age\n"), "runbook-update-validation-missing", "never-printed"),
+    # The interim p2 copy stays separate from Stage 4.
+    "runbook-p2-scope-removed": (replace(RUNBOOK, P2_NOT_STAGE4, "**It is the Stage 4 upload.**"), "runbook-p2-scope-missing", "never-printed"),
+    "runbook-p2-section-renamed": (replace(RUNBOOK, P2_SECTION, "## Stage 4 snapshot upload\n"), "runbook-p2-scope-missing", "never-printed"),
+    "runbook-p2-wildcard-cleanup": (append(RUNBOOK, "\nrm -f -- ~/hc-recovery/out/stage3-p2-snapshot*\n"), "runbook-broad-delete", "never-printed"),
 }
 
 
@@ -272,7 +313,11 @@ def main() -> None:
             for line in (base / TEMPLATE).read_text(encoding="utf-8").splitlines():
                 cells = line.strip().strip("|").split("|") if line.lstrip().startswith("|") else []
                 if len(cells) >= 2 and "<" in cells[-1]:
-                    value = previous if "Previous inventory object" in line else "filled"
+                    value = (
+                        previous if "Previous inventory object" in line
+                        else PREVIOUS_SHA if "Previous inventory ciphertext SHA-256" in line
+                        else "filled"
+                    )
                     line = "|".join(["", *cells[:-1], f" `{value}` ", ""])
                 lines.append(line)
             return "\n".join(lines) + "\n"
@@ -286,21 +331,41 @@ def main() -> None:
         assert result.returncode == 0 and result.stdout.strip() == "PASS", f"filled inventory rejected:\n{result.stderr}"
         result = check_inventory(good, "--previous-key", PREVIOUS_KEY)
         assert result.returncode == 0, f"replacement with the right previous key rejected:\n{result.stderr}"
+        result = check_inventory(good, "--previous-key", PREVIOUS_KEY, "--previous-sha256", PREVIOUS_SHA)
+        assert result.returncode == 0, f"replacement with the right previous key and SHA-256 rejected:\n{result.stderr}"
+        # A same-date replacement: the previous object key is this inventory's own key.
+        result = check_inventory(good, "--previous-key", "recovery/recovery-inventory/2026-10-29.age", "--previous-sha256", PREVIOUS_SHA)
+        assert result.returncode == 0, f"same-date replacement rejected:\n{result.stderr}"
         template_text = (base / TEMPLATE).read_text(encoding="utf-8")
         result = check_inventory(template_text)
         assert result.returncode == 0, "a decrypted inventory with unfilled rows must still pass without --previous-key"
+        # A previous inventory made before the replacement rows existed (2026-10-29) still
+        # passes the previous-inventory check, but not as a replacement.
+        older = "\n".join(
+            line for line in good.splitlines()
+            if "Interim manual p2 snapshot copy" not in line and "Previous inventory ciphertext SHA-256" not in line
+        ) + "\n"
+        result = check_inventory(older)
+        assert result.returncode == 0, f"a previous inventory without the replacement rows was rejected:\n{result.stderr}"
         for text, extra, rule in (
             (template_text, ("--previous-key", PREVIOUS_KEY), "inventory-placeholder-left"),
             (good, ("--previous-key", "recovery/recovery-inventory/2026-10-18.age"), "inventory-previous-key-mismatch"),
             (good, ("--previous-key", "recovery/k3s-server-token/2026-10-29.age"), "inventory-previous-key-format"),
+            (good, ("--previous-key", PREVIOUS_KEY, "--previous-sha256", "d4" * 32), "inventory-previous-sha256-mismatch"),
+            (good, ("--previous-key", PREVIOUS_KEY, "--previous-sha256", "D4" * 32), "inventory-previous-sha256-format"),
+            (good, ("--previous-key", PREVIOUS_KEY, "--previous-sha256", "d4" * 31), "inventory-previous-sha256-format"),
+            (older, ("--previous-key", PREVIOUS_KEY), "inventory-row-missing"),
+            (good.replace(" Snapshot it preserves ", " Renamed field "), ("--previous-key", PREVIOUS_KEY), "inventory-row-missing"),
             (good.replace(ENC_ROW.split("|")[2], " Renamed field "), (), "inventory-row-missing"),
             (good + f"\n{FAKE_SECRET_KEY}\n", (), "age-secret-key"),
             (good + f"\n| Account | {FAKE_ACCOUNT} |\n", (), "aws-account-id"),
         ):
             result = check_inventory(text, *extra)
             assert result.returncode == 1 and f": {rule}\n" in result.stderr, f"--check-inventory missed {rule}:\n{result.stderr}"
-            for value in ("filled", FAKE_SECRET_KEY, FAKE_ACCOUNT, PREVIOUS_KEY):
+            for value in ("filled", FAKE_SECRET_KEY, FAKE_ACCOUNT, PREVIOUS_KEY, PREVIOUS_SHA, "d4" * 31):
                 assert value not in result.stdout + result.stderr, f"--check-inventory printed a value for {rule}"
+        result = run(base, "--check-inventory", str(inventory), "--previous-sha256", PREVIOUS_SHA)
+        assert result.returncode == 1 and "needs --check-inventory and --previous-key" in result.stderr, "--previous-sha256 accepted without --previous-key"
         link = Path(temp, "inventory-link.md")
         link.symlink_to(inventory)
         result = run(base, "--check-inventory", str(link))

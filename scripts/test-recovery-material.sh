@@ -18,10 +18,19 @@
 #          removal of the plaintext after a failure or TERM, the encrypt guard against
 #          a leftover previous plaintext, an unchanged previous ciphertext, the tmpfs
 #          gate outside test mode, and mutants with a guard disabled.
+# Group G: stage3-p2-snapshot, the interim manual p2 snapshot copy, with a synthetic
+#          snapshot directory and checkpoints file: source binding and substitution,
+#          the checkpoint record, the 64 MiB cap, sudo and the ownership transition
+#          (through a stub runuser that can damage the created file), substitution
+#          during encryption (through an age wrapper), verify's expected SHA-256,
+#          interrupted transfers, tmpfs sizing and the memory check, TERM cleanup,
+#          receipts, collisions and explicit new versions in S3 (including a same-date
+#          inventory update), the scoped cleanup of its run files, and mutants.
 #
 # Every run uses RECOVERY_MATERIAL_TEST=1 overrides or stubs. These tests do NOT
-# exercise production sudo or runuser, the tmpfs mount, the swap check, the /dev/tty
-# passphrase prompt, SSH, AWS or S3. Fixtures that look like secrets are assembled at runtime.
+# exercise production sudo or the real runuser, the tmpfs mount, the swap check, the
+# /dev/tty passphrase prompt, SSH, AWS or S3. Fixtures that look like secrets are
+# assembled at runtime.
 #
 # Requires: bash, coreutils, python3; for group B, age and age-keygen v1.3.2.
 set -euo pipefail
@@ -356,7 +365,7 @@ while (( $# )); do
   esac
 done
 service="${args[0]}" operation="${args[1]}"
-key="" body="" version="" checksum="" bucket="" outfile=""
+key="" body="" version="" checksum="" bucket="" outfile="" query=""
 # Every remaining option takes a value; the first bare word is the positional
 # outfile (get-object), wherever it appears.
 for ((i = 2; i < ${#args[@]}; i++)); do
@@ -366,6 +375,7 @@ for ((i = 2; i < ${#args[@]}; i++)); do
     --body) body="${args[$((i + 1))]}"; i=$((i + 1)) ;;
     --version-id) version="${args[$((i + 1))]}"; i=$((i + 1)) ;;
     --checksum-sha256) checksum="${args[$((i + 1))]}"; i=$((i + 1)) ;;
+    --query) query="${args[$((i + 1))]}"; i=$((i + 1)) ;;
     --*) i=$((i + 1)) ;;
     *) [[ -z "$outfile" ]] && outfile="${args[$i]}" ;;
   esac
@@ -374,15 +384,30 @@ error() {
   echo "An error occurred ($1) when calling the $2 operation: User: ${FAKE_AWS_ARN} is not authorized on ${bucket}" >&2
   exit 254
 }
+b64sha() { python3 -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$1"; }
 [[ -z "${FAKE_AWS_FAIL:-}" || "$service $operation" == "sts get-caller-identity" ]] || error "$FAKE_AWS_FAIL" "$operation"
+# The current version is the object file. Once a key has a second version, every
+# version is also kept as <object>.stub-version-N.
 object="${FAKE_AWS_STORE}/$(printf '%s' "$key" | tr '/' '_')"
 case "$service $operation" in
   "sts get-caller-identity") echo "$FAKE_AWS_ARN" ;;
-  "s3api head-object") [[ -f "$object" ]] && echo '{}' || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; } ;;
+  "s3api head-object")
+    [[ -f "$object" ]] || { echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; exit 254; }
+    if [[ "$query" == "ChecksumSHA256" ]]; then
+      if [[ -n "${FAKE_AWS_NO_CHECKSUM:-}" ]]; then echo "None"; else b64sha "$object"; fi
+    else
+      echo '{}'
+    fi ;;
   "s3api put-object")
-    actual="$(python3 -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$body")"
+    actual="$(b64sha "$body")"
     [[ "$actual" == "$checksum" ]] || error BadDigest PutObject
+    n=1
+    if [[ -f "$object" ]]; then
+      [[ -f "${object}.stub-version-1" ]] || cp -- "$object" "${object}.stub-version-1"
+      n=$(( $(find "$FAKE_AWS_STORE" -maxdepth 1 -name "${object##*/}.stub-version-*" | wc -l) + 1 ))
+    fi
     cp -- "$body" "$object"
+    (( n == 1 )) || cp -- "$body" "${object}.stub-version-${n}"
     # Plants a path during the upload, after the helper's own pre-checks.
     if [[ -n "${FAKE_AWS_PLANT:-}" ]]; then
       case "${FAKE_AWS_PLANT_KIND:-file}" in
@@ -393,11 +418,17 @@ case "$service $operation" in
         filelink) printf 'target\n' >"${FAKE_AWS_PLANT}.target"; ln -s "${FAKE_AWS_PLANT}.target" "$FAKE_AWS_PLANT" ;;
       esac
     fi
-    printf '%s\n' "${FAKE_AWS_VERSION:-stub-version-1}" ;;
+    printf '%s\n' "${FAKE_AWS_VERSION:-stub-version-${n}}" ;;
   "s3api get-object")
-    [[ "$version" == "stub-version-1" && -f "$object" ]] || error NoSuchVersion GetObject
+    src=""
+    if [[ "$version" == "stub-version-1" && ! -f "${object}.stub-version-1" && -f "$object" ]]; then
+      src="$object"
+    elif [[ "$version" =~ ^stub-version-[0-9]+$ && -f "${object}.${version}" ]]; then
+      src="${object}.${version}"
+    fi
+    [[ -n "$src" ]] || error NoSuchVersion GetObject
     [[ -n "$outfile" ]] || { echo "stub aws: no outfile" >&2; exit 2; }
-    cp -- "$object" "$outfile"
+    cp -- "$src" "$outfile"
     echo "${FAKE_AWS_RETURNED_VERSION:-$version}" ;;
   *) echo "stub aws: unsupported call" >&2; exit 2 ;;
 esac
@@ -953,11 +984,15 @@ if [[ "$(cat "${receipts}/raced.receipt")" == "planted" ]]; then pass "encryptio
 # a FIFO (a write would block), a link to a device, a dangling link, a link to a file.
 # timeout bounds a helper that wrongly opens the FIFO.
 race=2026-10-30
+ec_upload_sha="$(sha256sum -- "${tmp}/ec-upload.age" | cut -d' ' -f1)"
+new_version_args=()
 for kind in fifo devnull dangling filelink; do
   expect "encryption-config: a ${kind} receipt that appears during upload is not written" 1 "receipt could not be written" -- \
     s3_private env FAKE_AWS_PLANT="${receipts}/race-${kind}.receipt" FAKE_AWS_PLANT_KIND="$kind" \
     timeout 20 bash "$s3_helper" upload --item "$item" --date "$race" --file "${tmp}/ec-upload.age" \
-    --receipt "${receipts}/race-${kind}.receipt" --new-version
+    --receipt "${receipts}/race-${kind}.receipt" "${new_version_args[@]}"
+  # The key exists after the first upload; later ones add versions explicitly.
+  new_version_args=(--new-version --replaces-sha256 "$ec_upload_sha")
 done
 if [[ -p "${receipts}/race-fifo.receipt" && "$(readlink "${receipts}/race-devnull.receipt")" == /dev/null \
   && ! -e "${receipts}/race-dangling.receipt.absent" && "$(cat "${receipts}/race-filelink.receipt.target")" == "target" ]]; then
@@ -1465,6 +1500,650 @@ if [[ "$f_seen" == "identity-archive.age previous-inventory.age previous-invento
 else
   fail "decrypt-inventory TERM" "exit ${f_rc}; seen before: ${f_seen}; left: $(find "$f_term" -mindepth 1 -maxdepth 1 -printf '%f ')"
 fi
+
+# --- group G: stage3-p2-snapshot (the interim manual p2 copy) -----------------------------
+echo "Group G: stage3-p2-snapshot (interim manual p2 snapshot copy)"
+p2_item=stage3-p2-snapshot
+p2_label=p2-post-encryption
+p2_name="stage3-p2-post-encryption-20261029t144551z-k3s01-1793285175"
+me_user="$(id -un)"
+me_uid="$(id -u)"
+fake_sum="$(printf 'ab%.0s' $(seq 32))"
+
+# Stand-in for runuser -u USER -- COMMAND...: records the user and runs COMMAND as the
+# test user. STUB_RUNUSER_CHMOD and STUB_RUNUSER_LINK then damage the created file, as
+# a broken ownership transition would.
+stub_runuser_dir="${tmp}/stub-runuser"
+mkdir -p "$stub_runuser_dir"
+cat >"${stub_runuser_dir}/runuser" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-u" && "${3:-}" == "--" ]] || { echo "stub runuser: unexpected arguments" >&2; exit 2; }
+printf '%s\n' "$2" >>"${STUB_RUNUSER_LOG:?}"
+shift 3
+target="${!#}"
+"$@"
+rc=$?
+[[ -n "${STUB_RUNUSER_CHMOD:-}" ]] && chmod "$STUB_RUNUSER_CHMOD" -- "$target"
+[[ -n "${STUB_RUNUSER_LINK:-}" ]] && ln -- "$target" "$STUB_RUNUSER_LINK"
+exit "$rc"
+EOF
+chmod 0755 "${stub_runuser_dir}/runuser"
+runuser_log="${tmp}/runuser.log"
+
+# p2_checkpoints [RECORD...]: the checkpoints file, with the earlier Stage 3 records
+# and then the given ones.
+p2_checkpoints() {
+  {
+    printf '1793223427 baseline stage3-baseline-20261028t213642z-k3s01-1793223427 12820512 %s token=present\n' "$fake_sum"
+    printf '1793223582 p0-pre-enable stage3-p0-pre-enable-20261028t213918z-k3s01-1793223582 12820512 %s token=present\n' "$fake_sum"
+    printf '1793282417 p1-pre-rotate stage3-p1-pre-rotate-20261029t135952z-k3s01-1793282417 9941024 %s token=present\n' "$fake_sum"
+    (( $# )) && printf '%s\n' "$@"
+  } >"$fx_ckpt"
+  chmod 0600 "$fx_ckpt"
+}
+# p2_fixture: a fresh snapshot directory and checkpoints file, standing in for
+# /var/lib/rancher/k3s/server/db/snapshots and /var/lib/homelab-secrets-encryption,
+# with a random p2 snapshot whose SHA-256 is recorded and must never be printed.
+p2_fixture() {
+  fx_root="$(fresh_dir)"
+  fx_snapdir="${fx_root}/snapshots"
+  mkdir -m 0700 "$fx_snapdir" "${fx_root}/state"
+  fx_snap="${fx_snapdir}/${p2_name}"
+  { head -c 200000 /dev/urandom; printf '%s\n' "$sentinel"; } >"$fx_snap"
+  chmod 0600 "$fx_snap"
+  fx_sha="$(sha256sum -- "$fx_snap" | cut -d' ' -f1)"
+  fx_size="$(stat -c %s -- "$fx_snap")"
+  fx_mtime="$(stat -c %Y -- "$fx_snap")"
+  never_print+=("$fx_sha")
+  fx_ckpt="${fx_root}/state/checkpoints"
+  fx_record="${fx_mtime} ${p2_label} ${p2_name} ${fx_size} ${fx_sha} token=present"
+  p2_checkpoints "$fx_record"
+  fx_out="$(fresh_dir)"
+}
+# p2 [NAME=VALUE...] -- ARGS: the helper (or $p2_helper) in test mode, bound to the
+# current fixture, as under sudo from the test user through the stub runuser.
+p2() {
+  local vars=()
+  while [[ "$1" != "--" ]]; do vars+=("$1"); shift; done
+  shift
+  run_test_mode env PATH="${stub_runuser_dir}:${p2_age_path:-$stub_path}" STUB_RUNUSER_LOG="$runuser_log" \
+    RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR="$fx_snapdir" RECOVERY_MATERIAL_TEST_CHECKPOINTS="$fx_ckpt" \
+    RECOVERY_MATERIAL_TEST_SUDO_USER="$me_user" RECOVERY_MATERIAL_TEST_SUDO_UID="$me_uid" \
+    "${vars[@]}" bash "${p2_helper:-$helper}" "$@"
+}
+p2_encrypt() {
+  local vars=()
+  while [[ "$1" != "--" ]]; do vars+=("$1"); shift; done
+  shift
+  p2 "${vars[@]}" -- encrypt --item "$p2_item" "$@"
+}
+p2_verify() {
+  local vars=()
+  while [[ "$1" != "--" ]]; do vars+=("$1"); shift; done
+  shift
+  p2 RECOVERY_MATERIAL_TEST_IDENTITY="${tmp}/plain-identity.txt" RECOVERY_MATERIAL_TEST_TMPDIR="$(fresh_dir)" \
+    "${vars[@]}" -- verify --item "$p2_item" "$@"
+}
+# refused MESSAGE -- COMMAND...: succeeds only if COMMAND fails and prints MESSAGE.
+refused() {
+  local message="$1"
+  shift 2
+  ! "$@" >"${tmp}/refused.out" 2>&1 && grep -qF -- "$message" "${tmp}/refused.out"
+}
+
+p2_fixture
+expect "p2: the checkpointed snapshot reaches age (stub refuses real work)" 1 "$reaches_age" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+if empty_dir "$fx_out" && [[ "$(tail -n 1 "$runuser_log")" == "$me_user" ]]; then
+  pass "p2: encrypt writes through runuser as the operator, and a failed encryption leaves no output"
+else
+  fail "p2: runuser and failed encryption" "runuser not used as the operator, or output left"
+fi
+if grep -qxF "SNAPSHOT_DIR=\"/var/lib/rancher/k3s/server/db/snapshots\"" "$helper" \
+  && grep -qxF "CHECKPOINTS_FILE=\"/var/lib/homelab-secrets-encryption/checkpoints\"" "$helper" \
+  && grep -qxF "SNAPSHOT_MAX_BYTES=\$(( 64 * 1024 * 1024 ))" "$helper"; then
+  pass "p2: the production snapshot directory, checkpoints file and 64 MiB cap are committed"
+else
+  fail "p2: production bindings" "the committed snapshot directory, checkpoints file or cap differs"
+fi
+
+# Source path and name.
+mkdir -m 0700 "${fx_root}/other"
+cp -p -- "$fx_snap" "${fx_root}/other/${p2_name}"
+expect "p2: a copy outside the snapshot directory is refused" 1 "must be directly in ${fx_snapdir}" -- \
+  p2_encrypt -- --source "${fx_root}/other/${p2_name}" --out "${fx_out}/s.age"
+for alias in "${fx_snapdir}/./${p2_name}" "${fx_snapdir}//${p2_name}" "${fx_root}/state/../snapshots/${p2_name}" "${fx_snap}/"; do
+  expect "p2: the alias ${alias#"$fx_root"} is refused" 1 "must be an absolute, normalized path" -- \
+    p2_encrypt -- --source "$alias" --out "${fx_out}/s.age"
+done
+rel_p2() { (cd "$fx_snapdir" && p2_encrypt -- --source "$p2_name" --out "${fx_out}/s.age"); }
+expect "p2: a relative path is refused" 1 "must be an absolute, normalized path" -- rel_p2
+for other_name in stage3-p1-pre-rotate-20261029t135952z-k3s01-1793282417 stage3-p2-post-encryption-20261029t144551z-k3s02-1793285175 \
+  stage3-p2-post-encryption-20261029T144551Z-k3s01-1793285175 "${p2_name}.bak" etcd-snapshot-k3s01-1793285175; do
+  cp -p -- "$fx_snap" "${fx_snapdir}/${other_name}"
+  expect "p2: a snapshot named ${other_name} is refused" 1 "is not named as a p2 post-encryption snapshot" -- \
+    p2_encrypt -- --source "${fx_snapdir}/${other_name}" --out "${fx_out}/s.age"
+  rm -f -- "${fx_snapdir}/${other_name}"
+done
+ln -s "$fx_snapdir" "${fx_root}/snap-link"
+expect "p2: a symbolic link to the snapshot directory is refused" 1 "a directory in the source path is a symbolic link: ${fx_root}/snap-link" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR="${fx_root}/snap-link" -- --source "${fx_root}/snap-link/${p2_name}" --out "${fx_out}/s.age"
+ln -s "$fx_root" "${tmp}/g-root-link"
+expect "p2: a symbolic link to an ancestor directory is refused" 1 "a directory in the source path is a symbolic link: ${tmp}/g-root-link" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR="${tmp}/g-root-link/snapshots" -- --source "${tmp}/g-root-link/snapshots/${p2_name}" --out "${fx_out}/s.age"
+expect "p2: a missing snapshot directory is refused" 1 "snapshot directory does not exist: ${fx_root}/absent" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR="${fx_root}/absent" -- --source "${fx_root}/absent/${p2_name}" --out "${fx_out}/s.age"
+expect "p2: a snapshot directory not owned by root:root is refused" 1 "snapshot directory is not owned by root:root (owner ${me})" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_PARENT_OWNER=0:0 -- --source "$fx_snap" --out "${fx_out}/s.age"
+for mode in 0770 0702 1777; do
+  chmod "$mode" "$fx_snapdir"
+  expect "p2: a mode ${mode} snapshot directory is refused" 1 "snapshot directory is writable by group or others (mode ${mode#0})" -- \
+    p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+chmod 0700 "$fx_snapdir"
+for bad_override in relative/snapshots "${fx_root}/./snapshots" "${fx_snapdir}/"; do
+  expect "p2: a non-normalized snapshot-directory override is refused" 1 "RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR must be an absolute, normalized path" -- \
+    p2_encrypt RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR="$bad_override" -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+
+# The file itself.
+p2_alt="${fx_snapdir}/stage3-p2-post-encryption-20261029t144552z-k3s01-1793285176"
+ln -s "$fx_snap" "$p2_alt"
+expect "p2: a symbolic link with a p2 name is refused" 1 "source is a symbolic link" -- \
+  p2_encrypt -- --source "$p2_alt" --out "${fx_out}/s.age"
+rm -f -- "$p2_alt"
+mkfifo -m 0600 "$p2_alt"
+expect "p2: a FIFO with a p2 name is refused" 1 "source is not a regular file" -- \
+  p2_encrypt -- --source "$p2_alt" --out "${fx_out}/s.age"
+rm -f -- "$p2_alt"
+install -m 0600 /dev/null "$p2_alt"
+expect "p2: an empty file with a p2 name is refused" 1 "source is empty" -- \
+  p2_encrypt -- --source "$p2_alt" --out "${fx_out}/s.age"
+rm -f -- "$p2_alt"
+ln -- "$fx_snap" "${fx_root}/other/hard-link"
+expect "p2: a snapshot with another hard link is refused" 1 "source has other hard links" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+rm -f -- "${fx_root}/other/hard-link"
+chmod 0400 "$fx_snap"
+expect "p2: a mode 0400 snapshot is refused" 1 "source must be mode 600 (mode 400)" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+for mode in 0640 0604 0660; do
+  chmod "$mode" "$fx_snap"
+  expect "p2: a mode ${mode} snapshot is refused" 1 "accessible to group or others (mode ${mode#0})" -- \
+    p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+chmod 0600 "$fx_snap"
+for source_owner in 0:0 "$other_user" "$other_group"; do
+  expect "p2: a snapshot not owned by the required ${source_owner} is refused" 1 "source is not owned by root:root (owner ${me})" -- \
+    p2_encrypt RECOVERY_MATERIAL_TEST_SOURCE_OWNER="$source_owner" -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+source_owner=""
+
+# The 64 MiB cap, before any digest is computed.
+p2_fixture
+truncate -s $(( 64 * 1024 * 1024 + 1 )) "$fx_snap"
+expect "p2: a snapshot over the 64 MiB cap is refused" 1 "source exceeds the 64 MiB cap" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+truncate -s $(( 64 * 1024 * 1024 )) "$fx_snap"
+expect "p2: a snapshot of exactly 64 MiB passes the cap (and reaches the checkpoint check)" 1 "source size differs from its checkpoint record" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+
+# The checkpoint record.
+p2_fixture
+expect "p2: a missing checkpoints file is refused" 1 "checkpoints file does not exist or is not a regular file" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_CHECKPOINTS="${fx_root}/state/absent" -- --source "$fx_snap" --out "${fx_out}/s.age"
+ln -s "$fx_ckpt" "${fx_root}/state/link"
+expect "p2: a symbolic-link checkpoints file is refused" 1 "checkpoints file is a symbolic link" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_CHECKPOINTS="${fx_root}/state/link" -- --source "$fx_snap" --out "${fx_out}/s.age"
+ln -- "$fx_ckpt" "${fx_root}/other-ckpt-link"
+expect "p2: a checkpoints file with another hard link is refused" 1 "checkpoints file has other hard links" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+rm -f -- "${fx_root}/other-ckpt-link"
+for mode in 0640 0604; do
+  chmod "$mode" "$fx_ckpt"
+  expect "p2: a mode ${mode} checkpoints file is refused" 1 "checkpoints file is accessible to group or others (mode ${mode#0})" -- \
+    p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+chmod 0600 "$fx_ckpt"
+chmod 0770 "${fx_root}/state"
+expect "p2: a group-writable checkpoint directory is refused" 1 "checkpoint directory is writable by group or others (mode 770)" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+chmod 0700 "${fx_root}/state"
+expect "p2: a non-normalized checkpoints override is refused" 1 "RECOVERY_MATERIAL_TEST_CHECKPOINTS must be an absolute, normalized path" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_CHECKPOINTS="${fx_root}/state/../state/checkpoints" -- --source "$fx_snap" --out "${fx_out}/s.age"
+p2_record_case() {
+  local label="$1" message="$2"
+  shift 2
+  p2_checkpoints "$@"
+  expect "p2: checkpoint record: ${label} is refused" 1 "$message" -- p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+  p2_checkpoints "$fx_record"
+}
+other_p2="stage3-p2-post-encryption-20261030t000000z-k3s01-1793318400"
+p2_record_case "no record" "exactly one record for the source (found 0)"
+p2_record_case "two records" "exactly one record for the source (found 2)" "$fx_record" "$fx_record"
+p2_record_case "a second p2 record" "exactly one ${p2_label} record (found 2)" "$fx_record" \
+  "1793318400 ${p2_label} ${other_p2} ${fx_size} ${fake_sum} token=present"
+p2_record_case "another label" "malformed or is not the ${p2_label} record" \
+  "${fx_mtime} p1-pre-rotate ${p2_name} ${fx_size} ${fx_sha} token=present" \
+  "1793318400 ${p2_label} ${other_p2} ${fx_size} ${fake_sum} token=present"
+p2_record_case "no token field" "malformed or is not the ${p2_label} record" "${fx_mtime} ${p2_label} ${p2_name} ${fx_size} ${fx_sha}"
+p2_record_case "an extra field" "malformed or is not the ${p2_label} record" "${fx_record} extra"
+p2_record_case "an uppercase SHA-256" "malformed or is not the ${p2_label} record" "${fx_mtime} ${p2_label} ${p2_name} ${fx_size} ${fx_sha^^} token=present"
+p2_record_case "a CRLF line" "malformed or is not the ${p2_label} record" "${fx_record}"$'\r'
+p2_record_case "another size" "source size differs from its checkpoint record" "${fx_mtime} ${p2_label} ${p2_name} $(( fx_size + 1 )) ${fx_sha} token=present"
+p2_record_case "another time" "source modification time differs from its checkpoint record" "$(( fx_mtime - 1 )) ${p2_label} ${p2_name} ${fx_size} ${fx_sha} token=present"
+p2_record_case "another SHA-256" "source SHA-256 differs from its checkpoint record" "${fx_mtime} ${p2_label} ${p2_name} ${fx_size} ${fake_sum} token=present"
+# Source substitution: another file under the p2 name, with the recorded size and time.
+[[ -d "${fx_root}/other" ]] || mkdir -m 0700 "${fx_root}/other"
+head -c "$fx_size" /dev/urandom >"${fx_root}/other/substitute"
+cat -- "${fx_root}/other/substitute" >"$fx_snap"
+touch -d "@${fx_mtime}" -- "$fx_snap"
+expect "p2: a substituted snapshot with the recorded name, size and time is refused" 1 "source SHA-256 differs from its checkpoint record" -- \
+  p2_encrypt -- --source "$fx_snap" --out "${fx_out}/s.age"
+
+# sudo from the operator's own account.
+p2_fixture
+for sudo_case in "RECOVERY_MATERIAL_TEST_SUDO_USER=" "RECOVERY_MATERIAL_TEST_SUDO_USER=root" \
+  "RECOVERY_MATERIAL_TEST_SUDO_UID=0" "RECOVERY_MATERIAL_TEST_SUDO_UID=" "RECOVERY_MATERIAL_TEST_SUDO_UID=x1"; do
+  expect "p2: encrypt without a non-root sudo operator (${sudo_case}) is refused" 1 "must be encrypted through sudo from the operator's own (non-root) account" -- \
+    p2_encrypt "$sudo_case" -- --source "$fx_snap" --out "${fx_out}/s.age"
+done
+expect "p2: an output directory not owned by the sudo operator is refused" 1 "output directory is not owned by the operator" -- \
+  p2_encrypt RECOVERY_MATERIAL_TEST_SUDO_UID="$(( me_uid + 1 ))" -- --source "$fx_snap" --out "${fx_out}/s.age"
+for name in RECOVERY_MATERIAL_TEST_SNAPSHOT_DIR RECOVERY_MATERIAL_TEST_CHECKPOINTS RECOVERY_MATERIAL_TEST_SUDO_USER \
+  RECOVERY_MATERIAL_TEST_SUDO_UID RECOVERY_MATERIAL_TEST_MEMINFO; do
+  expect "p2: ${name} outside test mode is refused" 1 "${name} is test-only and is refused outside test mode" -- \
+    env -u RECOVERY_MATERIAL_TEST -u RECOVERY_MATERIAL_TEST_EXPECTED_SOURCE PATH="$stub_path" "${name}=${fx_snapdir}" \
+    bash "$helper" encrypt --item "$p2_item" --source "$fx_snap" --out "${fx_out}/s.age"
+done
+if empty_dir "$fx_out"; then pass "p2: refused encryptions write no ciphertext"; else fail "p2: refused encryptions" "a ciphertext was written"; fi
+
+# verify, before anything is decrypted (stub age).
+one_sum="$(sha256sum -- "${tmp}/one-x25519.age" | cut -d' ' -f1)"
+expect "p2: verify without --ciphertext-sha256 is refused" 1 "verify needs --ciphertext-sha256" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --source "$fx_snap"
+expect "p2: verify with a malformed --ciphertext-sha256 is refused" 1 "--ciphertext-sha256 must be 64 hexadecimal characters" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "${one_sum:0:63}" --source "$fx_snap"
+expect "p2: verify of a ciphertext with another SHA-256 is refused" 1 "does not have the expected SHA-256 (incomplete or different transfer); nothing was decrypted" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$fake_sum" --source "$fx_snap"
+expect "p2: verify reaches decryption with the expected SHA-256 (stub age fails)" 1 "result: ERROR" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+p2_checkpoints "${fx_mtime} ${p2_label} ${p2_name} ${fx_size} ${fake_sum} token=present"
+expect "p2: verify refuses a snapshot that is not the checkpointed one" 1 "source SHA-256 differs from its checkpoint record" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+p2_checkpoints "$fx_record"
+chmod 0400 "$fx_snap"
+expect "p2: verify applies the snapshot checks (mode 0400 refused)" 1 "source must be mode 600 (mode 400)" -- \
+  p2_verify -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+chmod 0600 "$fx_snap"
+meminfo() { printf 'MemTotal:       8131788 kB\nMemAvailable: %8s kB\n' "$1" >"${tmp}/meminfo"; }
+meminfo 163839
+expect "p2: verify refuses when MemAvailable is below twice the 80 MiB tmpfs" 1 "not enough available memory for the 80 MiB private tmpfs" -- \
+  p2_verify RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/meminfo" -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+meminfo 163840
+expect "p2: verify accepts exactly twice the tmpfs size (reaches decryption)" 1 "result: ERROR" -- \
+  p2_verify RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/meminfo" -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+meminfo 100000
+expect "p2: the small items keep the 4 MiB tmpfs (100000 kB is enough)" 1 "result: ERROR" -- \
+  run_test_mode env PATH="$stub_path" RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/meminfo" RECOVERY_MATERIAL_TEST_IDENTITY="${tmp}/plain-identity.txt" \
+  RECOVERY_MATERIAL_TEST_TMPDIR="$(fresh_dir)" bash "$helper" verify --item k3s-server-token --ciphertext "${tmp}/one-x25519.age" --source "$source_file"
+expect "p2: an unreadable MemAvailable is refused" 1 "could not read MemAvailable" -- \
+  p2_verify RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/absent-meminfo" -- --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap"
+
+# TERM during the decryption of a snapshot ciphertext.
+g_term="$(fresh_dir)"
+g_pidfile="${tmp}/stub-age-p2.pid"
+set +e
+p2 STUB_AGE_SLEEP_PIDFILE="$g_pidfile" RECOVERY_MATERIAL_TEST_IDENTITY="${tmp}/plain-identity.txt" RECOVERY_MATERIAL_TEST_TMPDIR="$g_term" -- \
+  verify --item "$p2_item" --ciphertext "${tmp}/one-x25519.age" --ciphertext-sha256 "$one_sum" --source "$fx_snap" >"${tmp}/g-term.out" 2>&1 &
+g_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$g_pidfile" ]] && break
+  sleep 0.1
+done
+g_seen="$(find "$g_term" -mindepth 1 -maxdepth 1 -printf '%f ')"
+g_bash="$(pgrep -P "$g_pid" -f recovery-material.sh || echo "$g_pid")"
+kill -TERM "$g_bash" 2>/dev/null
+kill -TERM "$(cat "$g_pidfile" 2>/dev/null)" 2>/dev/null
+wait "$g_pid"
+g_rc=$?
+set -e
+if [[ "$g_seen" == "plain " && "$g_rc" -eq 143 ]] && empty_dir "$g_term" && ! leaked "${tmp}/g-term.out"; then
+  pass "p2: TERM during decryption removes the plaintext and exits 143"
+else
+  fail "p2: TERM during decryption" "exit ${g_rc}; seen: ${g_seen}; left: $(find "$g_term" -mindepth 1 -maxdepth 1 -printf '%f ')"
+fi
+
+# Round trips, ownership transitions and substitution during encryption (real age).
+if (( real_age_ok )); then
+  p2_age_path="$PATH"
+  real_age="$(command -v age)"
+  key_vars=(RECOVERY_MATERIAL_TEST_RECIPIENT="${key_dir}/recipient" RECOVERY_MATERIAL_TEST_IDENTITY="${key_dir}/identity")
+  p2_fixture
+  expect "p2: the checkpointed snapshot encrypts" ok "the only ${p2_label} checkpoint record with matching name, size, time and SHA-256" -- \
+    p2_encrypt "${key_vars[@]}" -- --source "$fx_snap" --out "${fx_out}/stage3-p2-snapshot.age"
+  g_ct="${fx_out}/stage3-p2-snapshot.age"
+  g_ct_sha="$(sed -n 's/^ciphertext sha256: //p' "${tmp}/out")"
+  if [[ -f "$g_ct" && "$(stat -c '%u %a %h' -- "$g_ct")" == "${me_uid} 600 1" && "$(tail -n 1 "$runuser_log")" == "$me_user" \
+    && "$g_ct_sha" == "$(sha256sum -- "$g_ct" | cut -d' ' -f1)" && "$(grep -ac '^-> X25519 ' "$g_ct")" == "1" ]] \
+    && ! grep -aqF "$sentinel" "$g_ct"; then
+    pass "p2: the ciphertext is created through runuser by the operator: mode 600, one link, printed SHA-256, no plaintext"
+  else
+    fail "p2: ciphertext ownership and properties" "owner, mode, links, runuser, SHA-256 or header differs"
+  fi
+  if ! grep -qF "$fx_size" "${tmp}/out"; then pass "p2: the snapshot size is not printed"; else fail "p2: snapshot size" "printed"; fi
+
+  # A broken ownership transition: the created file is not mode 600, or has another link.
+  for chmod_mode in 0644 0640 0400; do
+    expect "p2: a ciphertext left mode ${chmod_mode} is removed and refused" 1 "is not a regular, singly linked, mode 600 file owned by the operator; it was removed" -- \
+      p2_encrypt "${key_vars[@]}" STUB_RUNUSER_CHMOD="$chmod_mode" -- --source "$fx_snap" --out "${fx_out}/bad-${chmod_mode}.age"
+    if [[ ! -e "${fx_out}/bad-${chmod_mode}.age" ]]; then pass "p2: the mode ${chmod_mode} ciphertext was removed"; else fail "p2: mode ${chmod_mode} ciphertext" "left behind"; fi
+  done
+  expect "p2: a ciphertext with another hard link is removed and refused" 1 "it was removed" -- \
+    p2_encrypt "${key_vars[@]}" STUB_RUNUSER_LINK="${fx_root}/other-link.age" -- --source "$fx_snap" --out "${fx_out}/linked.age"
+  if [[ ! -e "${fx_out}/linked.age" && -f "${fx_root}/other-link.age" ]]; then
+    pass "p2: the linked ciphertext's own name was removed (the planted link is outside the run)"
+  else
+    fail "p2: linked ciphertext" "the run's name was left, or the planted link is missing"
+  fi
+  rm -f -- "${fx_root}/other-link.age"
+
+  # Substitution during encryption: an age wrapper changes the source after reading it.
+  age_wrap_dir="${tmp}/age-wrap"
+  mkdir -p "$age_wrap_dir"
+  cat >"${age_wrap_dir}/age" <<EOF
+#!/usr/bin/env bash
+"${real_age}" "\$@"
+rc=\$?
+if [[ "\${1:-}" != "--version" && -n "\${WRAP_AGE_TOUCH:-}" ]]; then
+  touch -d @1 -- "\$WRAP_AGE_TOUCH"
+fi
+if [[ "\${1:-}" != "--version" && -n "\${WRAP_AGE_REWRITE:-}" ]]; then
+  m="\$(stat -c %Y -- "\$WRAP_AGE_REWRITE")"
+  head -c "\$(stat -c %s -- "\$WRAP_AGE_REWRITE")" /dev/urandom >"\${WRAP_AGE_REWRITE}.new"
+  cat -- "\${WRAP_AGE_REWRITE}.new" >"\$WRAP_AGE_REWRITE"
+  rm -f -- "\${WRAP_AGE_REWRITE}.new"
+  touch -d "@\${m}" -- "\$WRAP_AGE_REWRITE"
+fi
+exit "\$rc"
+EOF
+  chmod 0755 "${age_wrap_dir}/age"
+  for wrap in WRAP_AGE_TOUCH WRAP_AGE_REWRITE; do
+    p2_fixture
+    p2_age_path="${age_wrap_dir}:${PATH}" expect "p2: a source changed during encryption (${wrap}) is refused" 1 \
+      "the source changed during encryption; the ciphertext was removed" -- \
+      p2_encrypt "${key_vars[@]}" "${wrap}=${fx_snap}" -- --source "$fx_snap" --out "${fx_out}/changed.age"
+    if empty_dir "$fx_out"; then pass "p2: the ciphertext of a changed source was removed (${wrap})"; else fail "p2: changed source" "ciphertext left"; fi
+  done
+
+  # verify: MATCH, DIFFER, ERROR and an interrupted transfer, each leaving nothing behind.
+  p2_fixture
+  p2_encrypt "${key_vars[@]}" -- --source "$fx_snap" --out "${fx_out}/stage3-p2-snapshot.age" >"${tmp}/out" 2>&1
+  g_ct="${fx_out}/stage3-p2-snapshot.age"
+  g_ct_sha="$(sha256sum -- "$g_ct" | cut -d' ' -f1)"
+  g_match="$(fresh_dir)"
+  expect "p2: verify reports MATCH in an 80 MiB tmpfs" ok "private tmpfs: 80 MiB" -- \
+    p2 "${key_vars[@]}" RECOVERY_MATERIAL_TEST_TMPDIR="$g_match" -- verify --item "$p2_item" --ciphertext "$g_ct" \
+    --ciphertext-sha256 "$g_ct_sha" --source "$fx_snap"
+  if grep -qF "result: MATCH" "${tmp}/out" && empty_dir "$g_match"; then pass "p2: MATCH leaves no plaintext behind"; else fail "p2: MATCH" "result or cleanup"; fi
+  head -c "$fx_size" /dev/urandom >"${tmp}/g-other-plain"
+  age -R "${key_dir}/recipient" -o "${tmp}/g-other.age" -- "${tmp}/g-other-plain"
+  g_differ="$(fresh_dir)"
+  expect "p2: verify reports DIFFER for another snapshot's ciphertext" 1 "result: DIFFER" -- \
+    p2 "${key_vars[@]}" RECOVERY_MATERIAL_TEST_TMPDIR="$g_differ" -- verify --item "$p2_item" --ciphertext "${tmp}/g-other.age" \
+    --ciphertext-sha256 "$(sha256sum -- "${tmp}/g-other.age" | cut -d' ' -f1)" --source "$fx_snap"
+  if empty_dir "$g_differ"; then pass "p2: DIFFER leaves no plaintext behind"; else fail "p2: DIFFER cleanup" "tmpdir not empty"; fi
+  age -R "${key_dir}/other-recipient" -o "${tmp}/g-wrong.age" -- "$fx_snap"
+  g_error="$(fresh_dir)"
+  expect "p2: verify reports ERROR for another recipient's ciphertext" 1 "result: ERROR" -- \
+    p2 "${key_vars[@]}" RECOVERY_MATERIAL_TEST_TMPDIR="$g_error" -- verify --item "$p2_item" --ciphertext "${tmp}/g-wrong.age" \
+    --ciphertext-sha256 "$(sha256sum -- "${tmp}/g-wrong.age" | cut -d' ' -f1)" --source "$fx_snap"
+  if empty_dir "$g_error"; then pass "p2: ERROR leaves no plaintext behind"; else fail "p2: ERROR cleanup" "tmpdir not empty"; fi
+  head -c "$(( $(stat -c %s -- "$g_ct") / 2 ))" -- "$g_ct" >"${tmp}/g-partial.age"
+  g_partial="$(fresh_dir)"
+  expect "p2: an interrupted transfer to k3s01 is refused before decryption" 1 "nothing was decrypted" -- \
+    p2 "${key_vars[@]}" RECOVERY_MATERIAL_TEST_TMPDIR="$g_partial" -- verify --item "$p2_item" --ciphertext "${tmp}/g-partial.age" \
+    --ciphertext-sha256 "$g_ct_sha" --source "$fx_snap"
+  if empty_dir "$g_partial"; then pass "p2: the refused transfer decrypted nothing"; else fail "p2: refused transfer" "tmpdir not empty"; fi
+  expect "p2: a small item still uses the 4 MiB tmpfs" ok "private tmpfs: 4 MiB" -- \
+    round env RECOVERY_MATERIAL_TEST_TMPDIR="$(fresh_dir)" bash "$helper" verify --item k3s-server-token \
+    --ciphertext "${out_dir}/token.age" --source "$source_file"
+
+  # The operator-owned ciphertext is removable by the scoped cleanup, as on k3s01.
+  g_parent="$(fresh_dir)"
+  g_host="${g_parent}/out"
+  run_helper "$helper" start-run --dir "$g_host" >/dev/null
+  p2_encrypt "${key_vars[@]}" -- --source "$fx_snap" --out "${g_host}/stage3-p2-snapshot.age" >/dev/null 2>&1
+  cp -- "$g_ct" "${g_host}/stage3-p2-snapshot.downloaded.age"
+  write_header "${g_host}/identity-archive.age" scrypt
+  expect "p2: the per-host cleanup removes the operator-owned run files" ok "run directory: absent" -- \
+    run_helper "$helper" cleanup --dir "$g_host" --remove stage3-p2-snapshot.age \
+    --remove stage3-p2-snapshot.downloaded.age --remove identity-archive.age
+  if [[ ! -e "$g_host" && -f "$fx_snap" && "$(sha256sum -- "$fx_snap" | cut -d' ' -f1)" == "$fx_sha" ]]; then
+    pass "p2: the cleanup left the snapshot unchanged"
+  else
+    fail "p2: cleanup" "run directory left, or snapshot changed"
+  fi
+  unset p2_age_path
+elif [[ "${RECOVERY_MATERIAL_REQUIRE_AGE:-}" == "1" ]]; then
+  fail "group G round trips" "age and age-keygen v1.3.2 are required (RECOVERY_MATERIAL_REQUIRE_AGE=1)"
+else
+  skipped=$((skipped + 1))
+  echo "skip group G round trips: age and age-keygen v1.3.2 are not on PATH"
+fi
+
+# S3: receipts, the expected ciphertext SHA-256, collisions and explicit new versions.
+g_s3_tmp="$(fresh_dir)"
+g_s3() { s3 env TMPDIR="$g_s3_tmp" "$@"; }
+g_date=2026-10-29
+g_receipts="$(fresh_dir)"
+g_object="${store}/recovery_stage3-p2-snapshot_${g_date}.age"
+write_header "${tmp}/g-upload.age" X25519
+head -c 4096 /dev/urandom >>"${tmp}/g-upload.age"
+g_up_sha="$(sha256sum -- "${tmp}/g-upload.age" | cut -d' ' -f1)"
+EXTRA_FORBIDDEN=stub-version-
+expect "p2 S3: upload without --receipt is refused" 1 "upload needs --receipt" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha"
+expect "p2 S3: upload without --ciphertext-sha256 is refused" 1 "upload needs --ciphertext-sha256" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --receipt "${g_receipts}/a"
+expect "p2 S3: a malformed --ciphertext-sha256 is refused" 1 "--ciphertext-sha256 must be 64 hexadecimal characters" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 x --receipt "${g_receipts}/a"
+expect "p2 S3: a file with another SHA-256 is refused" 1 "nothing was uploaded" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$fake_sum" --receipt "${g_receipts}/a"
+head -c "$(( $(stat -c %s -- "${tmp}/g-upload.age") / 2 ))" -- "${tmp}/g-upload.age" >"${tmp}/g-partial-upload.age"
+expect "p2 S3: an interrupted transfer to the workstation is refused" 1 "does not have the expected SHA-256 (incomplete or different transfer)" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-partial-upload.age" --ciphertext-sha256 "$g_up_sha" --receipt "${g_receipts}/a"
+write_header "${tmp}/g-big.age" X25519
+truncate -s $(( 65 * 1024 * 1024 + 1 )) "${tmp}/g-big.age"
+expect "p2 S3: a ciphertext over 65 MiB is refused" 1 "ciphertext exceeds 65 MiB" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-big.age" \
+  --ciphertext-sha256 "$(sha256sum -- "${tmp}/g-big.age" | cut -d' ' -f1)" --receipt "${g_receipts}/a"
+rm -f -- "${tmp}/g-big.age"
+if [[ ! -e "$g_object" && -z "$(ls -A -- "$g_receipts")" ]]; then pass "p2 S3: refused uploads send nothing and write no receipt"; else fail "p2 S3: refused uploads" "object or receipt written"; fi
+expect "p2 S3: upload writes a private receipt" ok "version receipt: ${g_receipts}/a" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" --receipt "${g_receipts}/a"
+if grep -qF "key: recovery/stage3-p2-snapshot/${g_date}.age" "${tmp}/out" && [[ "$(stat -c '%a' "${g_receipts}/a")" == "600" ]] \
+  && [[ "$(cat "${g_receipts}/a")" == "key: recovery/stage3-p2-snapshot/${g_date}.age"$'\n'"version id: stub-version-1" ]]; then
+  pass "p2 S3: the receipt holds the stage3-p2-snapshot key and version, mode 600"
+else
+  fail "p2 S3: receipt" "key, mode or contents differ"
+fi
+expect "p2 S3: a second upload to the same key is refused" 1 "already exists; pass --new-version with --replaces-sha256" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" --receipt "${g_receipts}/b"
+expect "p2 S3: --new-version without --replaces-sha256 is refused" 1 "--new-version needs --replaces-sha256" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" --receipt "${g_receipts}/b" --new-version
+expect "p2 S3: --new-version without --receipt is refused" 1 "--new-version needs --receipt" -- \
+  g_s3 bash "$s3_helper" upload --item grafana-admin --date "$g_date" --file "${tmp}/g-upload.age" --new-version --replaces-sha256 "$g_up_sha"
+expect "p2 S3: --replaces-sha256 without --new-version is refused" 1 "--replaces-sha256 is only valid with --new-version" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date 2026-10-31 --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" \
+  --receipt "${g_receipts}/b" --replaces-sha256 "$g_up_sha"
+expect "p2 S3: --new-version replacing another SHA-256 is refused" 1 "does not have the SHA-256 given with --replaces-sha256; nothing was uploaded" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" \
+  --receipt "${g_receipts}/b" --new-version --replaces-sha256 "$fake_sum"
+expect "p2 S3: --new-version when S3 has no stored checksum is refused" 1 "has no stored SHA-256 checksum" -- \
+  g_s3 env FAKE_AWS_NO_CHECKSUM=1 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" \
+  --ciphertext-sha256 "$g_up_sha" --receipt "${g_receipts}/b" --new-version --replaces-sha256 "$g_up_sha"
+expect "p2 S3: --new-version for a key that does not exist is refused" 1 "does not exist; --new-version only adds a version to an existing key" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date 2026-10-30 --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" \
+  --receipt "${g_receipts}/b" --new-version --replaces-sha256 "$g_up_sha"
+if [[ -z "$(find "$store" -maxdepth 1 -name 'recovery_stage3-p2-snapshot_*.stub-version-*' -print -quit)" && ! -e "${g_receipts}/b" ]]; then
+  pass "p2 S3: refused new versions add no version and write no receipt"
+else
+  fail "p2 S3: refused new versions" "a version or receipt was written"
+fi
+# After a lost receipt: the same ciphertext again, as an explicit new version.
+expect "p2 S3: an explicit new version over the recorded ciphertext is accepted" ok "version receipt: ${g_receipts}/b" -- \
+  g_s3 bash "$s3_helper" upload --item "$p2_item" --date "$g_date" --file "${tmp}/g-upload.age" --ciphertext-sha256 "$g_up_sha" \
+  --receipt "${g_receipts}/b" --new-version --replaces-sha256 "$g_up_sha"
+if [[ "$(sed -n 's/^version id: //p' "${g_receipts}/b")" == "stub-version-2" ]]; then pass "p2 S3: the new version is pinned in its own receipt"; else fail "p2 S3: new version" "receipt version differs"; fi
+expect "p2 S3: download by --version-id is refused" 1 "download needs --receipt" -- \
+  g_s3 bash "$s3_helper" download --item "$p2_item" --date "$g_date" --version-id stub-version-1 \
+  --out "${tmp}/g-d0.age" --compare-with "${tmp}/g-upload.age"
+for receipt_name in a b; do
+  expect "p2 S3: download by receipt ${receipt_name} reports MATCH" ok "result: MATCH" -- \
+    g_s3 bash "$s3_helper" download --item "$p2_item" --date "$g_date" --receipt "${g_receipts}/${receipt_name}" \
+    --out "${tmp}/g-d-${receipt_name}.age" --compare-with "${tmp}/g-upload.age"
+done
+EXTRA_FORBIDDEN=""
+
+# A same-date inventory update, as an explicit new version on top of the exact previous one.
+write_header "${tmp}/g-inv-a.age" X25519
+printf 'inventory-a' >>"${tmp}/g-inv-a.age"
+write_header "${tmp}/g-inv-b.age" X25519
+printf 'inventory-b' >>"${tmp}/g-inv-b.age"
+g_inv_a_sha="$(sha256sum -- "${tmp}/g-inv-a.age" | cut -d' ' -f1)"
+g_inv_b_sha="$(sha256sum -- "${tmp}/g-inv-b.age" | cut -d' ' -f1)"
+expect "inventory: the first inventory of the day uploads" ok "version id: stub-version-1" -- \
+  g_s3 bash "$s3_helper" upload --item recovery-inventory --date "$g_date" --file "${tmp}/g-inv-a.age"
+expect "inventory: a same-date update without --new-version is refused" 1 "already exists" -- \
+  g_s3 bash "$s3_helper" upload --item recovery-inventory --date "$g_date" --file "${tmp}/g-inv-b.age" --receipt "${g_receipts}/inv"
+expect "inventory: a same-date update replacing the wrong version is refused" 1 "does not have the SHA-256 given with --replaces-sha256" -- \
+  g_s3 bash "$s3_helper" upload --item recovery-inventory --date "$g_date" --file "${tmp}/g-inv-b.age" --receipt "${g_receipts}/inv" \
+  --new-version --replaces-sha256 "$g_inv_b_sha"
+EXTRA_FORBIDDEN=stub-version-2
+expect "inventory: a same-date update is added as an explicit, receipted new version" ok "version receipt: ${g_receipts}/inv" -- \
+  g_s3 bash "$s3_helper" upload --item recovery-inventory --date "$g_date" --file "${tmp}/g-inv-b.age" --receipt "${g_receipts}/inv" \
+  --new-version --replaces-sha256 "$g_inv_a_sha"
+expect "inventory: the new version downloads by its receipt" ok "result: MATCH" -- \
+  g_s3 bash "$s3_helper" download --item recovery-inventory --date "$g_date" --receipt "${g_receipts}/inv" \
+  --out "${tmp}/g-inv-b.downloaded.age" --compare-with "${tmp}/g-inv-b.age"
+EXTRA_FORBIDDEN=""
+expect "inventory: the previous same-date version is still downloadable" ok "result: MATCH" -- \
+  g_s3 bash "$s3_helper" download --item recovery-inventory --date "$g_date" --version-id stub-version-1 \
+  --out "${tmp}/g-inv-a.downloaded.age" --compare-with "${tmp}/g-inv-a.age"
+expect "inventory: a stale update on top of the replaced version is refused" 1 "does not have the SHA-256 given with --replaces-sha256" -- \
+  g_s3 bash "$s3_helper" upload --item recovery-inventory --date "$g_date" --file "${tmp}/g-inv-b.age" --receipt "${g_receipts}/inv2" \
+  --new-version --replaces-sha256 "$g_inv_a_sha"
+if empty_dir "$g_s3_tmp"; then pass "p2 S3: work directories removed after every case"; else fail "p2 S3: cleanup" "work directory left behind"; fi
+
+# The scoped cleanup with the snapshot's run files (no test mode).
+g_ws_parent="$(fresh_dir)"
+g_kept="${g_ws_parent}/recovery-inventory.age"
+write_header "$g_kept" X25519
+g_ws="${g_ws_parent}/run-2026-10-30"
+run_helper "$helper" start-run --dir "$g_ws" >/dev/null
+head -c 60 -- "${tmp}/g-upload.age" >"${g_ws}/stage3-p2-snapshot.age"
+for name in stage3-p2-snapshot.downloaded.age recovery-inventory.age recovery-inventory.downloaded.age; do write_header "${g_ws}/${name}" X25519; done
+touch "${g_ws}/stage3-p2-snapshot.age.part"
+expect "p2 cleanup: an unexpected partial-transfer name refuses the whole cleanup" 1 "unexpected entry in the run directory; nothing was removed" -- \
+  run_helper "$helper" cleanup --dir "$g_ws" --remove stage3-p2-snapshot.age --remove stage3-p2-snapshot.downloaded.age \
+  --remove recovery-inventory.age --remove recovery-inventory.downloaded.age --keep "$g_kept"
+expect "p2 cleanup: a receipt name is not a run file" 1 "not a run file name" -- \
+  run_helper "$helper" cleanup --dir "$g_ws" --remove stage3-p2-snapshot.receipt
+if [[ "$(find "$g_ws" -mindepth 1 -maxdepth 1 | wc -l)" -eq 6 ]]; then pass "p2 cleanup: the refusals removed nothing"; else fail "p2 cleanup refusals" "files removed"; fi
+rm -f -- "${g_ws}/stage3-p2-snapshot.age.part"
+expect "p2 cleanup: a truncated transfer and the run's other files are removed; the earlier inventory is kept" ok "retained unchanged: ${g_kept}" -- \
+  run_helper "$helper" cleanup --dir "$g_ws" --remove stage3-p2-snapshot.age --remove stage3-p2-snapshot.downloaded.age \
+  --remove recovery-inventory.age --remove recovery-inventory.downloaded.age --keep "$g_kept"
+if [[ ! -e "$g_ws" && -f "$g_kept" ]]; then pass "p2 cleanup: run directory absent, earlier inventory present"; else fail "p2 cleanup" "run directory left or earlier inventory missing"; fi
+
+# Mutants: each guard disabled in a copy of a helper must let its scenario through.
+g_mutant="${mutant_dir}/recovery-material.sh"
+g_s3_mutant="${mutant_dir}/recovery-material-s3.sh"
+g_mutant_case() {
+  local label="$1" source="$2" expression="$3" scenario="$4" target
+  target="$g_mutant"
+  [[ "$source" == "$s3_helper" ]] && target="$g_s3_mutant"
+  sed "$expression" "$source" >"$target"
+  if cmp -s -- "$source" "$target"; then
+    fail "p2 mutant: ${label}" "mutation anchor not found"
+  elif ! "$scenario" "$source"; then
+    fail "p2 mutant: ${label}" "the scenario fails against the real helper"
+  elif "$scenario" "$target"; then
+    fail "p2 mutant: ${label}" "the scenario passed with the guard disabled"
+  else
+    pass "p2 mutant: ${label}: killed by ${scenario#sc_}"
+  fi
+}
+sc_encrypt_refused() { # HELPER MESSAGE [NAME=VALUE...]
+  local helper_path="$1" message="$2"
+  shift 2
+  p2_helper="$helper_path" refused "$message" -- p2_encrypt "$@" -- --source "$fx_snap" --out "${fx_out}/m.age"
+}
+sc_substituted() { p2_fixture; head -c "$fx_size" /dev/urandom >"${fx_root}/sub"; cat -- "${fx_root}/sub" >"$fx_snap"; touch -d "@${fx_mtime}" -- "$fx_snap"; sc_encrypt_refused "$1" "SHA-256 differs from its checkpoint record"; }
+sc_size() { p2_fixture; p2_checkpoints "${fx_mtime} ${p2_label} ${p2_name} $(( fx_size + 1 )) ${fx_sha} token=present"; sc_encrypt_refused "$1" "source size differs"; }
+sc_mtime() { p2_fixture; p2_checkpoints "$(( fx_mtime + 1 )) ${p2_label} ${p2_name} ${fx_size} ${fx_sha} token=present"; sc_encrypt_refused "$1" "modification time differs"; }
+sc_one_record() { p2_fixture; p2_checkpoints "$fx_record" "$fx_record"; sc_encrypt_refused "$1" "exactly one record for the source"; }
+sc_one_label() { p2_fixture; p2_checkpoints "$fx_record" "1793318400 ${p2_label} ${other_p2} ${fx_size} ${fake_sum} token=present"; sc_encrypt_refused "$1" "exactly one ${p2_label} record"; }
+sc_directory() { p2_fixture; mkdir -m 0700 "${fx_root}/other"; cp -p -- "$fx_snap" "${fx_root}/other/${p2_name}"; fx_snap="${fx_root}/other/${p2_name}"; sc_encrypt_refused "$1" "must be directly in"; }
+sc_name() { p2_fixture; cp -p -- "$fx_snap" "${fx_snapdir}/${p2_name}.bak"; fx_snap="${fx_snapdir}/${p2_name}.bak"; sc_encrypt_refused "$1" "is not named as a p2 post-encryption snapshot"; }
+sc_links() { p2_fixture; ln -- "$fx_snap" "${fx_root}/hard"; sc_encrypt_refused "$1" "source has other hard links"; }
+sc_mode() { p2_fixture; chmod 0400 "$fx_snap"; sc_encrypt_refused "$1" "source must be mode 600"; }
+sc_cap() { p2_fixture; truncate -s $(( 64 * 1024 * 1024 + 1 )) "$fx_snap"; sc_encrypt_refused "$1" "exceeds the 64 MiB cap"; }
+sc_ckpt_link() { p2_fixture; mv -- "$fx_ckpt" "${fx_ckpt}.real"; ln -s "${fx_ckpt}.real" "$fx_ckpt"; sc_encrypt_refused "$1" "checkpoints file is a symbolic link"; }
+sc_sudo() { p2_fixture; sc_encrypt_refused "$1" "must be encrypted through sudo" RECOVERY_MATERIAL_TEST_SUDO_USER=; }
+sc_verify_refused() { # HELPER MESSAGE CIPHERTEXT SHA [NAME=VALUE...]
+  local helper_path="$1" message="$2" ciphertext="$3" sum="$4"
+  shift 4
+  p2_helper="$helper_path" refused "$message" -- p2_verify "$@" -- --ciphertext "$ciphertext" ${sum:+--ciphertext-sha256 "$sum"} --source "$fx_snap"
+}
+sc_verify_sha() { p2_fixture; sc_verify_refused "$1" "does not have the expected SHA-256" "${tmp}/one-x25519.age" "$fake_sum"; }
+sc_verify_required() { p2_fixture; sc_verify_refused "$1" "verify needs --ciphertext-sha256" "${tmp}/one-x25519.age" ""; }
+sc_memory() { p2_fixture; meminfo 1000; sc_verify_refused "$1" "not enough available memory" "${tmp}/one-x25519.age" "$one_sum" RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/meminfo"; }
+sc_tmpfs_size() { p2_fixture; meminfo 100000; sc_verify_refused "$1" "not enough available memory for the 80 MiB private tmpfs" "${tmp}/one-x25519.age" "$one_sum" RECOVERY_MATERIAL_TEST_MEMINFO="${tmp}/meminfo"; }
+g_mutant_case "no checkpoint SHA-256 guard" "$helper" 's/|| die "the source SHA-256 differs from its checkpoint record"/|| :/' sc_substituted
+g_mutant_case "no checkpoint size guard" "$helper" 's/|| die "the source size differs/|| : "/' sc_size
+g_mutant_case "no checkpoint time guard" "$helper" 's/|| die "the source modification time differs/|| : "/' sc_mtime
+g_mutant_case "no single-record guard" "$helper" 's/|| die "the checkpoints file must hold exactly one record/|| : "/' sc_one_record
+# In these patterns, "." stands for a literal "$" of the helper's text.
+g_mutant_case "no single-p2-record guard" "$helper" 's/|| die "the checkpoints file must hold exactly one .{SNAPSHOT_LABEL}/|| : "/' sc_one_label
+g_mutant_case "no snapshot-directory binding" "$helper" 's/|| die "the stage3-p2-snapshot source must be directly in/|| : "/' sc_directory
+g_mutant_case "no p2 name guard" "$helper" 's/|| die "the stage3-p2-snapshot source is not named/|| : "/' sc_name
+g_mutant_case "no link-count guard" "$helper" 's/|| die "the stage3-p2-snapshot source has other hard links/|| : "/' sc_links
+g_mutant_case "no mode-600 guard" "$helper" 's/|| die "the stage3-p2-snapshot source must be mode 600/|| : "/' sc_mode
+g_mutant_case "no 64 MiB cap" "$helper" 's/|| die "the stage3-p2-snapshot source exceeds the 64 MiB cap/|| : "/' sc_cap
+g_mutant_case "no checkpoints-link guard" "$helper" 's/|| die "the checkpoints file is a symbolic link/|| : "/' sc_ckpt_link
+g_mutant_case "no sudo-operator requirement" "$helper" 's/|| require_sudo_operator ".item"/|| :/' sc_sudo
+g_mutant_case "no expected-ciphertext guard in verify" "$helper" 's/|| die "the ciphertext does not have the expected SHA-256/|| : "/' sc_verify_sha
+g_mutant_case "verify without --ciphertext-sha256" "$helper" 's/if \[\[ ".item" == "stage3-p2-snapshot" && -z ".expected_sha256" \]\]; then/if false; then/' sc_verify_required
+g_mutant_case "no memory guard" "$helper" 's/|| die "not enough available memory/|| : "/' sc_memory
+g_mutant_case "4 MiB tmpfs for the snapshot" "$helper" 's/^SNAPSHOT_TMPFS_MIB=80$/SNAPSHOT_TMPFS_MIB=4/' sc_tmpfs_size
+if (( real_age_ok )); then
+  p2_age_path="$PATH"
+  sc_output_owner() { p2_fixture; sc_encrypt_refused "$1" "mode 600 file owned by the operator" "${key_vars[@]}" STUB_RUNUSER_CHMOD=0644; }
+  sc_changed() { p2_fixture; p2_age_path="${age_wrap_dir}:${PATH}" sc_encrypt_refused "$1" "the source changed during encryption" "${key_vars[@]}" "WRAP_AGE_TOUCH=${fx_snap}"; }
+  g_mutant_case "no output ownership check" "$helper" 's/^check_output() {$/check_output() { return 0/' sc_output_owner
+  g_mutant_case "no post-encryption source check" "$helper" 's/die "the source changed during encryption; the ciphertext was removed"/:/' sc_changed
+  unset p2_age_path
+fi
+sc_s3_store() { g_store="$(fresh_dir)"; cp -- "${tmp}/g-upload.age" "${g_store}/recovery_stage3-p2-snapshot_${g_date}.age"; }
+sc_s3_refused() { # HELPER MESSAGE UPLOAD-ARGS...
+  local helper_path="$1" message="$2"
+  shift 2
+  refused "$message" -- g_s3 env FAKE_AWS_STORE="$g_store" bash "$helper_path" upload --date "$g_date" --file "${tmp}/g-upload.age" "$@"
+}
+sc_s3_replaces() { sc_s3_store; sc_s3_refused "$1" "does not have the SHA-256 given with --replaces-sha256" --item "$p2_item" \
+  --ciphertext-sha256 "$g_up_sha" --receipt "$(fresh_dir)/r" --new-version --replaces-sha256 "$fake_sum"; }
+sc_s3_nv_receipt() { sc_s3_store; sc_s3_refused "$1" "--new-version needs --receipt" --item grafana-admin --new-version --replaces-sha256 "$g_up_sha"; }
+sc_s3_p2_receipt() { g_store="$(fresh_dir)"; sc_s3_refused "$1" "upload needs --receipt" --item "$p2_item" --ciphertext-sha256 "$g_up_sha"; }
+sc_s3_expected() { g_store="$(fresh_dir)"; sc_s3_refused "$1" "does not have the expected SHA-256" --item "$p2_item" --ciphertext-sha256 "$fake_sum" --receipt "$(fresh_dir)/r"; }
+sc_s3_absent() { g_store="$(fresh_dir)"; sc_s3_refused "$1" "does not exist; --new-version" --item "$p2_item" --ciphertext-sha256 "$g_up_sha" \
+  --receipt "$(fresh_dir)/r" --new-version --replaces-sha256 "$g_up_sha"; }
+g_mutant_case "no replaced-version guard" "$s3_helper" 's/|| die "the current version of .{key} does not have the SHA-256/|| : "/' sc_s3_replaces
+g_mutant_case "new version without a receipt" "$s3_helper" 's/|| die "--new-version needs --receipt/|| : "/' sc_s3_nv_receipt
+g_mutant_case "stage3-p2-snapshot without a receipt" "$s3_helper" 's/^RECEIPT_ITEMS=(encryption-config stage3-p2-snapshot)$/RECEIPT_ITEMS=(encryption-config)/' sc_s3_p2_receipt
+g_mutant_case "no expected-ciphertext guard on upload" "$s3_helper" 's/|| die "the file does not have the expected SHA-256/|| : "/' sc_s3_expected
+g_mutant_case "new version for an absent key" "$s3_helper" 's/    die ".{key} does not exist; --new-version/    : "/' sc_s3_absent
 
 echo
 printf 'Recovery-material helper tests: %d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
