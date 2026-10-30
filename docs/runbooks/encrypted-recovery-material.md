@@ -428,6 +428,145 @@ On any of these, Stage 3 stays incomplete. The cluster keeps running encrypted, 
 - the source file's size was removed from the metadata it says may be recorded. This helper never records the plaintext or source size, only its mode, ownership and path checks, and the ciphertext's size and SHA-256;
 - `MATCH`/`MISMATCH` was replaced with `MATCH`, `DIFFER` or `ERROR`, the results the helper reports.
 
+## The interim manual p2 snapshot copy (stage3-p2-snapshot)
+
+**What it is.** A one-time, manually preserved, `age`-encrypted copy of the Stage 3 p2 (post-encryption) etcd snapshot. It is stored as `recovery/stage3-p2-snapshot/<YYYY-MM-DD>.age` with the routine role, so that a post-activation snapshot exists off the node before Stage 4.
+
+**It is not a Stage 4 upload.** Stage 4 is K3s's built-in, scheduled upload of etcd snapshots under `etcd/`, with the etcd machine identity ([design](../design/backup-disaster-recovery.md#etcd-and-k3s-server-token-backup)). This copy does not configure, test or replace that, and making it does not complete Stage 4. It is recorded in the inventory's **Interim manual p2 snapshot copy** rows, never as a Stage 4 restore point. When a Stage 4 upload of a later snapshot is verified, mark this copy superseded.
+
+**What a restore would need.** This ciphertext and the age identity; the K3s server token recovery copy, because the snapshot's bootstrap data is encrypted with the token; and the encryption-configuration recovery copy, because the snapshot's Secrets are encrypted with its key. No restore from this copy has been rehearsed.
+
+**Approvals.** Each live step needs its own approval: the encryption on `k3s01`; the upload; the decryption comparison; the inventory update; and each offline copy.
+
+### What is never done
+
+- The plaintext snapshot never leaves `k3s01`, and is never copied, moved, renamed or deleted there.
+- The snapshot's own size and SHA-256 are never printed or recorded. The helper compares the SHA-256 only with the value already in the Stage 3 checkpoints file.
+- This procedure does not copy the snapshot ciphertext to Recovery A, Recovery B or OneDrive. Only the updated inventory goes to the recovery media.
+- No K3s `etcd-s3` setting is added, and nothing is written under `etcd/`.
+
+### What the helper enforces
+
+`encrypt` and `verify` refuse the source unless all of the following hold, checking metadata first:
+- it is an absolute, normalized path directly in `/var/lib/rancher/k3s/server/db/snapshots`. That directory must be `root:root` and not writable by group or others, with no symbolic link anywhere in its path;
+- its name has the p2 form, `stage3-p2-post-encryption-<YYYYMMDD>t<HHMMSS>z-k3s01-<epoch>`;
+- it is a regular, nonempty, singly linked `root:root` file, mode `600`, at most 64 MiB, whose canonical path is itself;
+- it is the only `p2-post-encryption` record in `/var/lib/homelab-secrets-encryption/checkpoints`, which must be a singly linked `root:root` file with no group or other access, in a `root:root` directory. The record's name, size, modification time and SHA-256 must match the file.
+
+`encrypt` also enforces:
+- **Ownership.** It must run through `sudo` from your own account, never as root directly. It writes the ciphertext as you, through `runuser`, and then requires a regular, singly linked, mode `600` file owned by you. Otherwise it removes the file. So `scp` and the scoped `cleanup`, which both run as you, can read and remove it.
+- **No substitution.** After encrypting, it checks the source again (device, inode, link count, size and times, and the SHA-256 against the record), and removes the ciphertext if anything changed.
+
+`verify` also enforces:
+- `--ciphertext-sha256`: the ciphertext must have the SHA-256 that `encrypt` printed, so an incomplete or wrong transfer is refused before anything is decrypted;
+- memory: it uses an 80 MiB private tmpfs, and refuses to mount it unless `MemAvailable` is at least twice that.
+
+The S3 helper requires a private receipt for both upload and download. On upload it also requires `--ciphertext-sha256`, and a ciphertext of at most 65 MiB.
+
+### Procedure
+
+The prerequisites, session hygiene and per-host cleanup are those of the token and Grafana procedure. First:
+- start the keep-alive;
+- create and verify the inventory tmpfs ([The filled inventory](#the-filled-inventory), step 1);
+- create the workstation run directory, `$run` ([Run directories](#run-directories-and-scoped-cleanup));
+- set up the helper copy on `k3s01`, with `~/hc-recovery/out` (prerequisite 7).
+
+`<snapshot date>` below is the UTC date in the snapshot's name, for example `2026-10-29` for the 2026-10-29 p2.
+
+1. **Preflight on `k3s01`**, metadata only:
+
+   ```bash
+   p2=/var/lib/rancher/k3s/server/db/snapshots/<p2 snapshot file name>
+   sudo stat -c '%a %U:%G %h %F' "$p2"                                 # must print: 600 root:root 1 regular file
+   sudo stat -c '%a %U:%G %F' /var/lib/rancher/k3s/server/db/snapshots  # root:root directory, no group or other write
+   swapon --show                                                       # must print nothing
+   awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo              # must be at least 163840 (kB)
+   ```
+
+   Swap on `k3s01` is off only until its next reboot. If it is on, stop.
+2. **Encrypt on `k3s01`**, in an interactive session (`ssh -t k3s01`):
+
+   ```bash
+   sudo bash ~/hc-recovery/scripts/recovery-material.sh encrypt --item stage3-p2-snapshot \
+     --source "$p2" --out ~/hc-recovery/out/stage3-p2-snapshot.age
+   stat -c '%a %U %h' ~/hc-recovery/out/stage3-p2-snapshot.age          # must print: 600 <your user> 1
+   ```
+
+   It prints the source check, the ciphertext path, size and SHA-256. Record the size and SHA-256 in the inventory. On the workstation, set `p2sha=<ciphertext SHA-256 printed by encrypt>`.
+3. **Copy the ciphertext to the workstation**, ciphertext only:
+
+   ```bash
+   scp k3s01:hc-recovery/out/stage3-p2-snapshot.age "$run/stage3-p2-snapshot.age"
+   sha256sum "$run/stage3-p2-snapshot.age"                             # must equal $p2sha
+   ```
+
+   If the copy is interrupted or the SHA-256 differs, do not upload. Repeat the `scp` into the same run file; `upload` refuses any file whose SHA-256 differs from `$p2sha`.
+4. **Upload, writing a private receipt:**
+
+   ```bash
+   bash scripts/recovery-material-s3.sh upload --item stage3-p2-snapshot --date <snapshot date> \
+     --file "$run/stage3-p2-snapshot.age" --ciphertext-sha256 "$p2sha" \
+     --receipt "$inv/stage3-p2-snapshot.receipt"
+   ```
+
+   It refuses an existing key, a missing or existing receipt, and a file that differs from `$p2sha`.
+5. **Download that exact version and compare the ciphertexts:**
+
+   ```bash
+   bash scripts/recovery-material-s3.sh download --item stage3-p2-snapshot --date <snapshot date> \
+     --receipt "$inv/stage3-p2-snapshot.receipt" --out "$run/stage3-p2-snapshot.downloaded.age" \
+     --compare-with "$run/stage3-p2-snapshot.age"
+   ```
+
+   It must print `result: MATCH`.
+6. **Controlled decryption comparison on `k3s01`.** Copy the downloaded ciphertext into the run directory there, and the identity archive as in step 5 of the token procedure:
+
+   ```bash
+   scp "$run/stage3-p2-snapshot.downloaded.age" k3s01:hc-recovery/out/stage3-p2-snapshot.downloaded.age
+   ```
+
+   Then, in an interactive session (`ssh -t k3s01`):
+
+   ```bash
+   sudo bash ~/hc-recovery/scripts/recovery-material.sh verify --item stage3-p2-snapshot \
+     --ciphertext ~/hc-recovery/out/stage3-p2-snapshot.downloaded.age \
+     --ciphertext-sha256 <ciphertext SHA-256 printed by encrypt> \
+     --source "$p2" --identity-archive ~/hc-recovery/out/identity-archive.age
+   findmnt -t tmpfs -S recovery-material                               # must print nothing
+   ```
+
+   It must print `private tmpfs: 80 MiB` and `result: MATCH`.
+7. **Record** in the filled inventory, inside its tmpfs, the **Interim manual p2 snapshot copy** rows: the object key; the version ID, read from the receipt in the editor; the ciphertext SHA-256 and size; the snapshot name; the source check; both comparisons; the cleanup result; the restore dependencies; the scope; and `Recovery-copy status: verified`.
+8. **Run the per-host cleanup on `k3s01`**, naming exactly this run's files:
+
+   ```bash
+   bash ~/hc-recovery/scripts/recovery-material.sh cleanup --dir ~/hc-recovery/out \
+     --remove stage3-p2-snapshot.age --remove stage3-p2-snapshot.downloaded.age \
+     --remove identity-archive.age
+   ```
+
+   Then remove the helper copy as in [Per-host cleanup](#per-host-cleanup).
+9. **Update the inventory** ([Updating an existing inventory](#updating-an-existing-inventory)). If the new inventory has the same date as the previous one, upload it as an explicit new version ([The filled inventory](#the-filled-inventory), step 3, same-date update). Then make the [offline copies](#offline-copies-on-recovery-a-and-b) of the new inventory under their timestamped names. Run the workstation run cleanup only after both are verified, naming this run's four files and passing `--keep "$prior"`.
+
+### Interruption and recovery
+
+- **`encrypt` fails or stops.** A failed encryption removes its partial output. If a file remains in `~/hc-recovery/out`, name it in the per-host cleanup; never remove it by hand.
+- **The ownership or substitution check fails.** The ciphertext is removed. Stop and find out why; do not retry until the cause is known.
+- **A transfer is interrupted** (in either direction). The SHA-256 differs, and `upload` or `verify` refuses the file before using it. Repeat the copy.
+- **The upload succeeds but the receipt is lost**, for example because WSL shut down. Follow [Partial failure](#partial-failure). To add the version again, pass `--new-version --replaces-sha256 "$p2sha"`, because the current version is this ciphertext, with a new receipt.
+- **The download fails.** Nothing is written to `--out`; run it again with the same receipt.
+- **`verify` is interrupted.** It removes its tmpfs files and unmounts the tmpfs. Confirm that `findmnt -t tmpfs -S recovery-material` prints nothing before retrying.
+- **`k3s01` reboots.** Its swap returns, so `verify` refuses. Stop.
+
+### Stop conditions for this item
+
+Stop, and do not improvise, if:
+- any source, checkpoint, ownership, substitution, memory or transfer check refuses;
+- either comparison is not `MATCH`;
+- the key already exists;
+- a receipt exists before the upload;
+- swap is active on `k3s01`.
+
 ## The filled inventory
 
 The filled inventory holds backup identifiers and version IDs, but no secret values. Its plaintext exists only in two places:
@@ -476,6 +615,19 @@ The filled inventory holds backup identifiers and version IDs, but no secret val
    ```
 
    On the workstation, `--identity-archive` points at the archive in its OneDrive location. `verify` copies it into its own tmpfs, removes that copy on exit, and does not create a transported copy on the WSL disk.
+
+   **Same-date update.** If this inventory has the same date as the one it replaces (for example a second inventory on 2026-10-29), its key already exists, and `upload` refuses it. Add the new version explicitly instead, and pin it with a receipt:
+
+   ```bash
+   bash scripts/recovery-material-s3.sh upload --item recovery-inventory --date <YYYY-MM-DD> \
+     --file "$run/recovery-inventory.age" --receipt "$inv/recovery-inventory.receipt" \
+     --new-version --replaces-sha256 <recorded previous inventory ciphertext SHA-256>
+   bash scripts/recovery-material-s3.sh download --item recovery-inventory --date <YYYY-MM-DD> \
+     --receipt "$inv/recovery-inventory.receipt" --out "$run/recovery-inventory.downloaded.age" \
+     --compare-with "$run/recovery-inventory.age"
+   ```
+
+   `--new-version` is refused unless the key exists, S3's stored SHA-256 checksum of its current version equals `--replaces-sha256`, and a new receipt is given. So it can only add a version on top of the exact inventory being replaced. The earlier version stays in S3 as a noncurrent version under the `recovery/` lifecycle; the inventory records it as **Previous inventory object** and **Previous inventory ciphertext SHA-256**.
 4. **Copy the exact-version downloaded ciphertext (`recovery-inventory.downloaded.age`, verified in step 3) to Recovery A, then to Recovery B**, as in [Offline copies](#offline-copies-on-recovery-a-and-b). If an offline plaintext copy is also required, copy `recovery-material-inventory.md` from the tmpfs straight to the recovery media in the same way. Never stage it through any other location.
 5. **Clean up the inventory tmpfs and check:**
 
@@ -533,7 +685,9 @@ Two values must be explicitly approved for the run before it starts. They are wr
 
    In the editor:
    - set **Inventory date** to this run's date;
-   - set **Previous inventory object** to the exact object key of the inventory being replaced, `recovery/recovery-inventory/<previous YYYY-MM-DD>.age`;
+   - set **Previous inventory object** to the exact object key of the inventory being replaced, `recovery/recovery-inventory/<previous YYYY-MM-DD>.age`. It may equal this run's key for a same-date update;
+   - set **Previous inventory ciphertext SHA-256** to the recorded previous inventory ciphertext SHA-256, the value given to `decrypt-inventory`;
+   - add any row the template has and the previous inventory lacks, such as the **Interim manual p2 snapshot copy** rows (`not made` where nothing was made);
    - update the rows of the items this run changed, reading any version ID from its receipt inside the editor (for example with `:r`);
    - mark a replaced item's earlier entry as superseded rather than deleting it.
 
@@ -542,15 +696,17 @@ Two values must be explicitly approved for the run before it starts. They are wr
 
    ```bash
    python3 scripts/validate-recovery-material.py --check-inventory "$inv/recovery-material-inventory.md" \
-     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age
+     --previous-key recovery/recovery-inventory/<previous YYYY-MM-DD>.age \
+     --previous-sha256 <recorded previous inventory ciphertext SHA-256>
    python3 scripts/validate-recovery-material.py --scan "$inv/recovery-material-inventory.md"
    ```
 
    `--check-inventory` must print `PASS`. It requires:
    - a regular file;
    - no secret-shaped content;
-   - every required inventory row, with no template placeholder left;
-   - **Previous inventory object** equal to the given key.
+   - every required inventory row and every replacement row, with no template placeholder left;
+   - **Previous inventory object** equal to the given key;
+   - **Previous inventory ciphertext SHA-256** equal to the given SHA-256.
 
    Like `--scan`, it prints only path, line number and rule name, never a value.
 5. **Remove the previous plaintext before encrypting:**
@@ -572,14 +728,22 @@ Only one recovery device is connected at a time. Copy and check sequentially, fr
 For each device in turn (Recovery A first; Recovery B when it is next available):
 
 1. Connect only that device and unlock it at the BitLocker prompt. Note its drive letter for this session only; never record it.
-2. Copy the exact-version downloaded ciphertext and check it against the SHA-256 recorded by `encrypt`. The download comparison reported `MATCH`, so the two are byte-identical:
+2. Copy the exact-version downloaded ciphertext to a **new, timestamped name**, and check it against the SHA-256 recorded by `encrypt`. The download comparison reported `MATCH`, so the two are byte-identical.
+   - The name is `recovery-inventory-<YYYY-MM-DD>-<YYYYMMDDTHHMMSSZ>.age`: the inventory date, then the UTC time at which this inventory version was encrypted, as recorded in the evidence. Recovery A and Recovery B therefore hold the same name for the same version, and two inventories with the same date never share a name.
+   - The copy is opened with `CreateNew`, which fails if the name exists in any form. An earlier copy on the device, such as `recovery-inventory-2026-10-29.age`, is never replaced, renamed, moved or removed.
 
    ```powershell
    $src = '\\wsl.localhost\Ubuntu\home\<user>\hc-recovery\run-<YYYY-MM-DD>\recovery-inventory.downloaded.age'
-   $dst = '<drive>:\home-cluster\recovery-inventory-<YYYY-MM-DD>.age'
-   Copy-Item -LiteralPath $src -Destination $dst
+   $dst = '<drive>:\home-cluster\recovery-inventory-<YYYY-MM-DD>-<YYYYMMDDTHHMMSSZ>.age'
+   $in = [IO.File]::OpenRead($src)
+   try {
+     $out = [IO.File]::Open($dst, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+     try { $in.CopyTo($out) } finally { $out.Dispose() }
+   } finally { $in.Dispose() }
    (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash -eq '<recorded ciphertext sha256>'   # must print True
    ```
+
+   If `CreateNew` fails because the name exists, stop: change nothing on the device. If the copy is interrupted or the check prints `False`, the device stays pending. Removing the incomplete file, by its exact name only, needs separate approval, and the copy is then repeated under the same name.
 
 3. Lock the device (`manage-bde -lock <drive>:`), eject it, and disconnect it before connecting the other.
 
@@ -604,7 +768,7 @@ bash scripts/recovery-material.sh cleanup --dir "$run" \
   --keep ~/hc-recovery/<retained ciphertext>
 ```
 
-Name with `--remove` exactly the files this run put in `$run`. For the `encryption-config` run, they are `encryption-config.age`, `encryption-config.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. Name with `--keep`, one per option, every ciphertext kept from an earlier run, such as each Stage 2 copy directly under `~/hc-recovery`. After an [inventory update](#updating-an-existing-inventory), also pass `--keep "$prior"`, so that `cleanup` confirms the previous inventory ciphertext is unchanged. `cleanup` must print `run directory: absent`, `retained unchanged:` for each kept file, and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)).
+Name with `--remove` exactly the files this run put in `$run`. For the `encryption-config` run, they are `encryption-config.age`, `encryption-config.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. For the [interim manual p2 snapshot copy](#the-interim-manual-p2-snapshot-copy-stage3-p2-snapshot), they are `stage3-p2-snapshot.age`, `stage3-p2-snapshot.downloaded.age`, `recovery-inventory.age` and `recovery-inventory.downloaded.age`. Name with `--keep`, one per option, every ciphertext kept from an earlier run, such as each Stage 2 copy directly under `~/hc-recovery`. After an [inventory update](#updating-an-existing-inventory), also pass `--keep "$prior"`, so that `cleanup` confirms the previous inventory ciphertext is unchanged. `cleanup` must print `run directory: absent`, `retained unchanged:` for each kept file, and `result: PASS` ([Run directories](#run-directories-and-scoped-cleanup)).
 
 ## Stop conditions
 
@@ -621,10 +785,10 @@ Stop the run, record the outcome only, and do not improvise if:
 
 ## Partial failure
 
-- **Upload succeeded, verification failed:** the object stays as an unverified version. Mark it unverified in the inventory, fix the cause, and re-run with `upload --new-version`. The routine role cannot delete objects.
+- **Upload succeeded, verification failed:** the object stays as an unverified version. Mark it unverified in the inventory, fix the cause, and re-run with `upload --new-version --replaces-sha256 <ciphertext SHA-256 of the current version> --receipt <new receipt>`. The routine role cannot delete objects.
 - **Download or comparison failed:** a failed or rejected download leaves nothing at `--out`. Re-run step 4 from the same version ID. If it still fails, treat the uploaded version as unverified.
 - **Inventory tmpfs lost after an upload** (for example, WSL shut down): the uploaded version is intact, but its receipt is gone. Stop, start the keep-alive, and recreate the tmpfs. Then either:
-  - upload again with `--new-version` and a new receipt, and repeat the comparisons; or
+  - upload again with `--new-version`, `--replaces-sha256` set to the recorded ciphertext SHA-256 of the version already uploaded, and a new receipt, and repeat the comparisons; or
   - with separate approval, rebuild the receipt from read-only S3 metadata, as on 2026-10-29. The listing must hold exactly one version and no delete marker for the exact key, the latest version, the recorded ciphertext size, and a `ChecksumSHA256` equal to the recorded ciphertext SHA-256. Write the receipt in the helper's two-line format, exclusively, mode 600, without printing the version ID. Prove it with `download --receipt … --compare-with` against the original ciphertext, which must report `result: MATCH`, and record the reconstruction as a deviation.
 - **Verification interrupted:** `verify` removes its tmpfs files and unmounts its tmpfs, keeps the original failure status, and reports any cleanup failure. Confirm that `findmnt -t tmpfs -S recovery-material` prints nothing before retrying.
 - **Stopped part-way through:** run the per-host cleanup on every host already used, and the inventory cleanup if its tmpfs exists, before anything else. Name with `--remove` only the run files that exist. The workstation run cleanup still waits until both offline copies are verified.

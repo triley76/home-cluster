@@ -19,12 +19,15 @@ It is never created on the WSL virtual disk, the Windows system disk, OneDrive o
 - any part of the K3s secrets-encryption configuration: a key, a key name, a provider entry, or a hash or size of the plaintext file;
 - the private identity, the identity-archive passphrase, or a passphrase hint;
 - the off-site location, the holder of Recovery B, or device serial numbers;
-- an AWS account ID, ARN, IAM Identity Center identifier, portal URL or email address.
+- an AWS account ID, ARN, IAM Identity Center identifier, portal URL or email address;
+- the size or SHA-256 of the p2 snapshot itself. The interim manual p2 snapshot copy rows record its ciphertext only.
 
 Every value below is a placeholder. The repository check (`scripts/validate-recovery-material.py`) fails if:
 - a value cell in this template is anything else;
 - a required row is missing;
 - a field asks for a plaintext-derived value or key material.
+
+The **Previous inventory ciphertext SHA-256** row and the **Interim manual p2 snapshot copy** rows were added after the 2026-10-29 inventory. A previous inventory may lack them, but every replacement inventory must have them.
 
 ## Record
 
@@ -35,6 +38,7 @@ Every value below is a placeholder. The repository check (`scripts/validate-reco
 | home-cluster revision to rebuild from | `<commit SHA>` |
 | homelab-k3s revision to rebuild from | `<commit SHA>` |
 | Previous inventory object | `<recovery/recovery-inventory/YYYY-MM-DD.age, or none>` |
+| Previous inventory ciphertext SHA-256 | `<ciphertext SHA-256 of the inventory version being replaced, or none>` |
 
 ## Recovery objects
 
@@ -54,6 +58,18 @@ Every value below is a placeholder. The repository check (`scripts/validate-reco
 | K3s secrets-encryption configuration | Verification cleanup | `<YYYY-MM-DD, tmpfs files removed and tmpfs unmounted: yes or no>` |
 | K3s secrets-encryption configuration | Key state it follows | `<UTC date of the rotate-keys run and p2 snapshot name it follows>` |
 | K3s secrets-encryption configuration | Recovery-copy status | `<verified, unverified, or superseded by YYYY-MM-DD>` |
+| Interim manual p2 snapshot copy | Object key | `<recovery/stage3-p2-snapshot/YYYY-MM-DD.age, or not made>` |
+| Interim manual p2 snapshot copy | S3 version ID | `<version ID, from the private upload receipt>` |
+| Interim manual p2 snapshot copy | Ciphertext SHA-256 | `<ciphertext SHA-256>` |
+| Interim manual p2 snapshot copy | Ciphertext bytes | `<ciphertext size in bytes>` |
+| Interim manual p2 snapshot copy | Snapshot it preserves | `<snapshot file name, checkpoint label p2-post-encryption>` |
+| Interim manual p2 snapshot copy | Source check | `<PASS: snapshot directory, p2 name, regular file, root:root, mode 600, single link, within 64 MiB, the only p2 checkpoint record matching>` |
+| Interim manual p2 snapshot copy | Exact-version download comparison | `<YYYY-MM-DD, MATCH or DIFFER>` |
+| Interim manual p2 snapshot copy | Decryption comparison | `<YYYY-MM-DD, MATCH, DIFFER or ERROR>` |
+| Interim manual p2 snapshot copy | Verification cleanup | `<YYYY-MM-DD, tmpfs files removed and tmpfs unmounted: yes or no>` |
+| Interim manual p2 snapshot copy | Restore dependencies | `<the server token object and the encryption-config object it needs>` |
+| Interim manual p2 snapshot copy | Scope | `<interim manual copy under recovery/; not a Stage 4 K3s upload under etcd/>` |
+| Interim manual p2 snapshot copy | Recovery-copy status | `<verified, unverified, or superseded by a Stage 4 etcd/ upload on YYYY-MM-DD>` |
 | Grafana admin credential | Object key | `<recovery/grafana-admin/YYYY-MM-DD.age>` |
 | Grafana admin credential | S3 version ID | `<version ID>` |
 | Grafana admin credential | Ciphertext SHA-256 | `<ciphertext SHA-256>` |
@@ -76,7 +92,7 @@ Every value below is a placeholder. The repository check (`scripts/validate-reco
 
 | Field | Value |
 | --- | --- |
-| etcd snapshot names and S3 version IDs | `<names and version IDs, or none yet (Stage 4)>` |
+| etcd snapshot names and S3 version IDs | `<names and version IDs of Stage 4 K3s uploads under etcd/, or none yet (Stage 4); never the interim manual p2 copy>` |
 | Velero backup names | `<names, or none yet (Stage 5)>` |
 
 ## Tool versions

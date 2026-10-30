@@ -6,9 +6,17 @@
 # Subcommands:
 #   check-role
 #       Confirm the session is the HomeClusterBackupOperator role. Prints PASS or FAIL.
-#   upload --item ITEM --date YYYY-MM-DD --file FILE.age [--new-version] [--receipt FILE]
+#   upload --item ITEM --date YYYY-MM-DD --file FILE.age [--receipt FILE]
+#          [--ciphertext-sha256 HEX] [--new-version --replaces-sha256 HEX]
 #       Upload to recovery/ITEM/DATE.age with an S3-verified SHA-256 checksum.
-#       Refuses to add a version to an existing key unless --new-version is given.
+#       With --ciphertext-sha256 (required for stage3-p2-snapshot), FILE must have
+#       that SHA-256, so an incomplete or different transfer is refused before
+#       anything is sent.
+#       Refuses an existing key. --new-version adds a version to an existing key
+#       deliberately (for example a same-date inventory update). It requires
+#       --replaces-sha256, the ciphertext SHA-256 of the version being replaced,
+#       which must equal S3's stored checksum of the current version, and --receipt,
+#       so that the new version is pinned. It is refused for a key that does not exist.
 #       With --receipt, the object key and version ID are written to a new private
 #       receipt file instead of being printed.
 #   download --item ITEM --date YYYY-MM-DD (--version-id ID | --receipt FILE)
@@ -18,9 +26,14 @@
 #       file using cmp -s. With --receipt, the version ID is read from the receipt,
 #       which must name the same object key, and is not printed.
 #
-# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config.
-# encryption-config (the K3s secrets-encryption configuration) requires --receipt
-# for both upload and download, so its version ID is never printed.
+# Items: k3s-server-token, grafana-admin, recovery-inventory, encryption-config,
+# stage3-p2-snapshot.
+# encryption-config (the K3s secrets-encryption configuration) and
+# stage3-p2-snapshot (the interim manual copy of the Stage 3 p2 etcd snapshot, kept
+# under recovery/ and separate from Stage 4's K3s uploads under etcd/) require
+# --receipt for both upload and download, so their version IDs are never printed.
+# stage3-p2-snapshot also requires --ciphertext-sha256 on upload, and a ciphertext
+# of at most 65 MiB (the helper's 64 MiB snapshot cap plus age's overhead).
 #
 # A receipt is a mode 600 file holding two lines, "key: <object key>" and
 # "version id: <version ID>", in a directory owned by the operator with no group
@@ -54,9 +67,11 @@ set +o history 2>/dev/null || true
 
 PROFILE="home-cluster-backup-operator"
 REGION="us-east-1"
-ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config)
+ITEMS=(k3s-server-token grafana-admin recovery-inventory encryption-config stage3-p2-snapshot)
 # Items whose version ID is kept in a receipt and never printed.
-RECEIPT_ITEMS=(encryption-config)
+RECEIPT_ITEMS=(encryption-config stage3-p2-snapshot)
+# The largest stage3-p2-snapshot ciphertext accepted.
+SNAPSHOT_CIPHERTEXT_MAX_BYTES=$(( 65 * 1024 * 1024 ))
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -217,8 +232,22 @@ sha256_hex() {
 
 # The digest bytes never pass through a shell variable: the variable holds only
 # "\xHH" text, and printf %b writes the raw bytes, including zero bytes, to the pipe.
+hex_base64() {
+  printf '%b' "$(printf '%s' "$1" | sed 's/../\\x&/g')" | base64 -w 0
+}
+
 sha256_base64() {
-  printf '%b' "$(sha256_hex "$1" | sed 's/../\\x&/g')" | base64 -w 0
+  hex_base64 "$(sha256_hex "$1")"
+}
+
+sha256_ok() {
+  [[ "${1,,}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# S3's stored SHA-256 checksum (base64) of the key's current version.
+current_checksum() {
+  aws_call s3api head-object --bucket "$bucket" --key "$key" --checksum-mode ENABLED \
+    --query ChecksumSHA256 --output text
 }
 
 # Copies $1 to $2, creating $2 exclusively (noclobber, O_EXCL) on descriptor 3 and
@@ -273,6 +302,7 @@ object_exists() {
 
 parse_args() {
   item="" date="" file="" version_id="" out="" compare="" receipt="" new_version=0
+  expected_sha256="" replaces_sha256=""
   while (( $# )); do
     if [[ "$1" == "--new-version" ]]; then
       new_version=1
@@ -288,6 +318,8 @@ parse_args() {
       --out) out="$2" ;;
       --compare-with) compare="$2" ;;
       --receipt) receipt="$2" ;;
+      --ciphertext-sha256) expected_sha256="$2" ;;
+      --replaces-sha256) replaces_sha256="$2" ;;
       *) die "unknown argument: $1" ;;
     esac
     shift 2
@@ -302,16 +334,42 @@ cmd_upload() {
   if receipt_item "$item"; then
     [[ -n "$receipt" ]] || die "${item} upload needs --receipt, so its version ID is not printed"
   fi
+  if [[ "$item" == "stage3-p2-snapshot" ]]; then
+    [[ -n "$expected_sha256" ]] || die "${item} upload needs --ciphertext-sha256, the SHA-256 that encrypt printed"
+  fi
+  if (( new_version )); then
+    [[ -n "$replaces_sha256" ]] || die "--new-version needs --replaces-sha256, the ciphertext SHA-256 of the version it replaces"
+    [[ -n "$receipt" ]] || die "--new-version needs --receipt, so the new version is pinned"
+    sha256_ok "$replaces_sha256" || die "--replaces-sha256 must be 64 hexadecimal characters"
+  else
+    [[ -z "$replaces_sha256" ]] || die "--replaces-sha256 is only valid with --new-version"
+  fi
   if [[ -n "$receipt" ]]; then
     [[ ! -e "$receipt" && ! -L "$receipt" ]] || die "the receipt already exists: ${receipt}"
     check_receipt_dir "$(dirname -- "$receipt")"
   fi
   header_ok "$file" || die "the file is not a single-recipient X25519 age ciphertext"
+  if [[ -n "$expected_sha256" ]]; then
+    sha256_ok "$expected_sha256" || die "--ciphertext-sha256 must be 64 hexadecimal characters"
+    [[ "$(sha256_hex "$file")" == "${expected_sha256,,}" ]] \
+      || die "the file does not have the expected SHA-256 (incomplete or different transfer); nothing was uploaded"
+  fi
+  if [[ "$item" == "stage3-p2-snapshot" ]]; then
+    (( $(wc -c < "$file") <= SNAPSHOT_CIPHERTEXT_MAX_BYTES )) || die "the ${item} ciphertext exceeds 65 MiB"
+  fi
   load_bucket
   require_role
 
-  if object_exists && (( ! new_version )); then
-    die "${key} already exists; pass --new-version to add a new version deliberately"
+  if object_exists; then
+    (( new_version )) || die "${key} already exists; pass --new-version with --replaces-sha256 to add a new version deliberately"
+    local current
+    current="$(current_checksum)" || die "could not read the current version's checksum"
+    [[ -n "$current" && "$current" != "None" ]] \
+      || die "the current version of ${key} has no stored SHA-256 checksum, so the version it replaces cannot be confirmed"
+    [[ "$current" == "$(hex_base64 "${replaces_sha256,,}")" ]] \
+      || die "the current version of ${key} does not have the SHA-256 given with --replaces-sha256; nothing was uploaded"
+  elif (( new_version )); then
+    die "${key} does not exist; --new-version only adds a version to an existing key"
   fi
 
   local checksum version
