@@ -430,7 +430,7 @@ On any of these, Stage 3 stays incomplete. The cluster keeps running encrypted, 
 
 ## The interim manual p2 snapshot copy (stage3-p2-snapshot)
 
-**What it is.** A one-time, manually preserved, `age`-encrypted copy of the Stage 3 p2 (post-encryption) etcd snapshot. It is stored as `recovery/stage3-p2-snapshot/<YYYY-MM-DD>.age` with the routine role, so that a post-activation snapshot exists off the node before Stage 4.
+**What it is.** A one-time, manually preserved, `age`-encrypted copy of the Stage 3 p2 (post-encryption) etcd snapshot. It is stored as `recovery/stage3-p2-snapshot/<YYYY-MM-DD>.age` with the routine role, so that a post-activation snapshot exists off the node before Stage 4. It was made once, on 2026-10-30; see the [validation record](../validation/encrypted-recovery-material.md#stage-3-the-interim-manual-p2-snapshot-copy-2026-10-30).
 
 **It is not a Stage 4 upload.** Stage 4 is K3s's built-in, scheduled upload of etcd snapshots under `etcd/`, with the etcd machine identity ([design](../design/backup-disaster-recovery.md#etcd-and-k3s-server-token-backup)). This copy does not configure, test or replace that, and making it does not complete Stage 4. It is recorded in the inventory's **Interim manual p2 snapshot copy** rows, never as a Stage 4 restore point. When a Stage 4 upload of a later snapshot is verified, mark this copy superseded.
 
