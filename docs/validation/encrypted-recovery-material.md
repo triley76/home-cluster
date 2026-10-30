@@ -6,7 +6,7 @@ This record documents the observed results of Stage 2 of the [backup and disaste
 
 It also documents a cluster incident that interrupted the work, and the cluster's restoration from a local etcd snapshot.
 
-The Stage 3 `encryption-config` recovery copy and the updated inventory, made on 2026-10-29, are recorded in their [own section](#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29), with their own evidence statement.
+The Stage 3 `encryption-config` recovery copy and the updated inventory, made on 2026-10-29, are recorded in their [own section](#stage-3-the-k3s-secrets-encryption-configuration-2026-10-29), with their own evidence statement. The interim manual p2 snapshot copy and the inventory update of 2026-10-30 are recorded in [another](#stage-3-the-interim-manual-p2-snapshot-copy-2026-10-30). That copy is not Stage 4.
 
 All evidence below was supplied by the repository owner. It was not independently accessed while this record was prepared.
 - Sanitized evidence files are stored outside this repository and identified by file name and SHA-256.
@@ -330,3 +330,100 @@ All four Stage 3 completion checks passed for the same `encryption-config` objec
 - **That the copy restores the key onto servers that lost it.** No restore rehearsal from the off-node recovery material was performed.
 - **Hypervisor paging.** That host page files or VM swap files did not hold recovery plaintext; see the runbook's [residual risks](../runbooks/encrypted-recovery-material.md#residual-risks).
 - **Scheduled operation.** No backup schedule exists yet.
+
+## Stage 3: the interim manual p2 snapshot copy (2026-10-30)
+
+This section records the [interim manual p2 snapshot copy](../runbooks/encrypted-recovery-material.md#the-interim-manual-p2-snapshot-copy-stage3-p2-snapshot) made from the live cluster on 2026-10-30 UTC, and the inventory update that followed it. The run started with the read-only AWS preflight; encryption on `k3s01` began at 12:55 and the final cleanup check ended at 15:27.
+
+**This is an interim manual Stage 3 recovery copy. It is not Stage 4.** It does not configure, test or replace K3s's scheduled snapshot uploads under `etcd/`, which remain pending.
+
+**How the evidence was produced:**
+- The work was run by an operator session in gated steps, each approved by the repository owner. The owner ran the steps that needed the identity-archive passphrase or administrator rights: both decryption comparisons, the decryption of the previous inventory, and the recovery-media copies. The owner reported their results.
+- Sanitized evidence is stored outside this repository: 11 directories named `stage3-p2-interim-copy-G<step>-<UTC time>`, 38 files. Each directory has a `SHA256SUMS` manifest. The index `stage3-p2-interim-copy-INDEX-20261030.txt` lists the SHA-256 of every manifest, and has SHA-256 `1f2afd7017b235f5622bcf97eb4b1dd68f5b8dcda23a17f2e236cc160f036a49`. Every manifest and the index verified.
+- A scan of the evidence for addresses, user and Windows paths, account and bucket details, ARNs, version IDs, drive letters, device labels, serials, identity or key material, snapshot names and unexpected digests reported no findings. Before the manifests were made, two device labels were replaced by device names, a preservation baseline was reduced to one opaque digest per entry, and two files were restricted to mode `600`.
+- The same exclusions apply as for Stage 2. In addition, no snapshot plaintext size or hash is recorded.
+
+### Timing and implementation (2026-10-30)
+
+| Item | Value |
+| --- | --- |
+| Source | The p2 snapshot recorded on `k3s01` on 2026-10-29 (see [Timing and implementation](#timing-and-implementation) above), selected only from the single `p2-post-encryption` record in the Stage 3 checkpoints file; its name was never typed |
+| home-cluster helpers | Reviewed `main` commit `39776b6` (pull request #25 merged), installed on `k3s01` from `git archive`; both files matched the commit's blobs |
+| homelab-k3s | `main` commit `7bbb8fb` |
+| Routine AWS access | `HomeClusterBackupOperator` only; `check-role` printed `PASS` before every AWS step. The session had expired at the start and was renewed by the owner |
+
+### Preflight (2026-10-30)
+
+| Check | Observed |
+| --- | --- |
+| Bucket configuration, read with the routine role | Versioning `Enabled`; default encryption `AES256`; all four Block Public Access settings `true`; policy status not public; all six lifecycle rules equal to the committed template, none expiring or transitioning current versions under `recovery/`. No `AccessDenied` |
+| Destination | `recovery/stage3-p2-snapshot/2026-10-29.age` absent: no versions, no delete markers, `HeadObject` 404. Rechecked immediately before the upload |
+| Previous inventory | `recovery/recovery-inventory/2026-10-29.age` had one current version; its stored `ChecksumSHA256` matched the ciphertext SHA-256 recorded above |
+| Cluster | `k3s` active on `k3s01`; local `/readyz` and `/readyz/etcd` `ok`; all three nodes Ready. The same before and after the decryption comparison, and before and after the `k3s01` cleanup |
+| Source, by metadata only | `600 root:root`, one link, a regular file at a path that resolves to itself, in a `root:root` directory with no group or other write; within 64 MiB. Size, modification time and SHA-256 matched the checkpoint record (compared, never printed) |
+| Swap and memory | No swap active on `k3s01` or in WSL; `MemAvailable` above twice the private tmpfs size |
+
+### Results (2026-10-30)
+
+| Item | Object key | Ciphertext | Upload | Exact-version download | Decryption comparison | `cmp -s` exit status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `stage3-p2-snapshot` | `recovery/stage3-p2-snapshot/2026-10-29.age` | 10152584 bytes, SHA-256 `21126ab8cd52f7c3f34053ecfb5ba2424480190b564c1540dd3ce39a6dda5cf0` | PASS, once, receipt-based; one current version, no delete marker; stored checksum and size matched | `MATCH` | `MATCH` against the checkpoint-bound source, on `k3s01`, in an 80 MiB private tmpfs, absent afterwards | 0 |
+| `recovery-inventory` | `recovery/recovery-inventory/2026-10-30.age` | 7728 bytes, SHA-256 `992a4979ad8d32cea6878e6014e071c7327abbf682a2e461881987935dcd6e4a`, encrypted 2026-10-30 14:20:49 UTC | PASS, once, receipt-based; one current version, no delete marker; stored checksum and size matched | `MATCH` | `MATCH` against the prepared inventory, on the workstation, absent afterwards | 0 |
+
+The `stage3-p2-snapshot` ciphertext was encrypted on `k3s01` through `sudo` from the operator's account, as a `600`, operator-owned, singly linked file, and the helper checked the source again after encrypting. It was fetched to the workstation as ciphertext only. The exact-version download was compared byte for byte with the uploaded ciphertext before it was copied back to `k3s01` for the decryption comparison. Its recovery-copy status is `verified`.
+
+### The updated inventory (2026-10-30)
+
+- **Built only in the private WSL tmpfs**, from the 2026-10-29 inventory, which `decrypt-inventory` decrypted into that tmpfs. That plaintext was removed before encryption.
+- **Changed:** Inventory date `2026-10-30`; home-cluster rebuild revision `39776b6`; Previous inventory object `recovery/recovery-inventory/2026-10-29.age`; the **Previous inventory ciphertext SHA-256** row, added with its previously recorded value; and the twelve **Interim manual p2 snapshot copy** rows, added. Every other line was unchanged and in order.
+- **The p2 rows** hold:
+  - the receipt's key and version ID, read inside the tmpfs and never displayed;
+  - the ciphertext SHA-256 and size above, and the snapshot name from the checkpoint;
+  - both comparisons and the cleanup result;
+  - the restore dependencies, naming the inventory's own server-token and encryption-config objects;
+  - the scope, "not a Stage 4 K3s upload under `etcd/`", and status `verified`.
+- **Checks:** `--check-inventory` with `--previous-key` and `--previous-sha256` printed `PASS`; the scan reported no findings; no placeholders were left; 69 table rows.
+- **Copies:** the exact-version downloaded, byte-matched ciphertext was copied create-new to both recovery devices as `recovery-inventory-2026-10-30-20261030T142049Z.age`.
+
+| Copy | Result | Afterwards |
+| --- | --- | --- |
+| Recovery A | Verified, as reported by the owner. The reviewed copy script refuses unless exactly one recovery device is connected, with BitLocker unlocked, fully encrypted, protection On, AES-256 and automatic unlock disabled; the destination is absent; and the copy has 7728 bytes and the recorded SHA-256, the file count rises by one and every pre-existing file is unchanged | Disconnected, as reported by the owner |
+| Recovery B | Verified, as reported by the owner, with the same script | Disconnected, as reported by the owner |
+
+No recovery device was connected at cleanup. The lock result of either device was not observed and is not recorded.
+
+### Cleanup (2026-10-30)
+
+| Host | Observed |
+| --- | --- |
+| `k3s01` | The helper's scoped cleanup removed exactly the two p2 ciphertexts and the transported identity archive, then the run directory. The helper and recipient copies were removed by name. `~/hc-recovery` absent, no `.age` files in the operator's home, no recovery tmpfs. The p2 snapshot and the checkpoints file were unchanged, and the snapshot still matched its record |
+| Workstation (WSL) | The updated inventory plaintext and both receipts were removed by name, and the inventory tmpfs was unmounted and removed. The keep-alive was stopped. The run's scoped cleanup removed exactly its four ciphertexts and the run directory, and retained the previous-inventory ciphertext unchanged. Every other entry under `~/hc-recovery`, including the Stage 2 files, matched its pre-cleanup baseline. No evidence directory was removed |
+| S3 | Nothing deleted. The p2 object, the 2026-10-30 inventory and the 2026-10-29 inventory each still had one current version and no delete marker |
+
+### Deviations and qualifications (2026-10-30)
+
+All were approved by the owner.
+- **Previous inventory ciphertext.** No copy from the 2026-10-29 run was left on the workstation, and the offline copies were out of scope. The current version of the 2026-10-29 inventory was therefore retrieved from S3 by a pinned `get-object`, because the S3 helper's `download` needs `--compare-with`. Its SHA-256 matched both the stored checksum and the recorded value. It is kept outside the inventory tmpfs and the run directory, in `~/hc-recovery/prior-inventory-2026-10-29/`.
+- **Inventory date.** `2026-10-30`, the run's date, so the inventory went to a new key rather than to a same-date new version.
+- **Rebuild revision.** Set to `39776b6`, the first `main` revision with the `stage3-p2-snapshot` item.
+- **Editing the inventory.** By a reviewed script inside the tmpfs instead of `vim`, printing only checks and counts.
+- **Transport to and from `k3s01`.** The workstation has no `k3s01` SSH alias, so the helper archive, the ciphertext fetch and the copies to `k3s01` went through the reviewed Ansible inventory:
+  - the `git archive` output was embedded in an Ansible `script`;
+  - the fetch was flat and of the ciphertext only;
+  - the copies used `force=no` and were checked to be new.
+
+  The owner's interactive decryption comparison used `ssh -t` with the same inventory settings.
+- **Stops caused by driver defects.** Each stopped a step before anything changed in AWS and before any file was transferred twice; each upload ran exactly once:
+  - a credential check that counted the hygiene variable `AWS_PAGER`;
+  - an AWS wrapper that passed its own label to the CLI;
+  - a keep-alive started by the operator session that exited early, after which the owner ran it in their own window;
+  - two output-masking and ordering errors in the checks around the `k3s01` transfer.
+- **Terminal exposure.** The server address appeared once in the owner's terminal, in SSH's closing message, and a user-home path appeared once in the operator session's output. Neither is in the evidence.
+
+### What this section does not show
+
+- **A restore.** No restore rehearsal from this copy, or from any off-node recovery material, was performed. Whether the p2 copy, the server token and the encryption configuration together restore the cluster onto servers that lost all three is untested.
+- **Stage 4.** No K3s `etcd-s3` setting was added, nothing was written under `etcd/`, and the etcd machine identity was not used. K3s's scheduled uploads, naming, pruning and retention are untested.
+- **Later cluster state.** The copy holds the cluster as it was at p2 on 2026-10-29.
+- **The recovery devices directly.** Their results are as reported by the owner; the operator session did not observe the copy output or a lock result.
+- **Hypervisor paging.** As for Stage 2; see the runbook's [residual risks](../runbooks/encrypted-recovery-material.md#residual-risks).

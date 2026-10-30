@@ -377,6 +377,7 @@ A restore from S3 directly through K3s's S3 options is also possible. It needs t
 - **It is recorded separately** in the recovery-material inventory, not as a Stage 4 restore point.
 - **It is superseded** once a Stage 4 upload of a later snapshot is verified.
 - **Restoring from it** follows the outline above, with the snapshot downloaded from `recovery/` and decrypted first. That path has not been rehearsed.
+- **Status:** made and verified once, on 2026-10-30, as `recovery/stage3-p2-snapshot/2026-10-29.age` ([validation record](../validation/encrypted-recovery-material.md#stage-3-the-interim-manual-p2-snapshot-copy-2026-10-30)). Stage 4 uploads remain pending.
 
 ## Secrets encryption at rest (prerequisite stage)
 
