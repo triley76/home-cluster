@@ -7,6 +7,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = ROOT / "scripts/validate-backup-infrastructure.py"
+DESIGN = "docs/design/backup-disaster-recovery.md"
 
 
 def run(root: Path) -> subprocess.CompletedProcess[str]:
@@ -29,6 +30,15 @@ def main() -> None:
         "disable-encryption": ("aws/backup/member-account.yaml", "SSEAlgorithm: AES256", "SSEAlgorithm: aws:kms"),
         "remove-tls-deny": ("aws/backup/member-account.yaml", "Sid: DenyOldTLS", "Sid: MissingOldTLSDeny"),
         "operator-admin": ("aws/backup/management-account.yaml", "SessionDuration: PT2H", "ManagedPolicies:\n        - AdministratorAccess\n      SessionDuration: PT2H"),
+        "stage4-prefix-matching-name": (DESIGN, "`etcd-snapshot-s4-{{ inventory_hostname }}`", "`etcd-snapshot-{{ inventory_hostname }}`"),
+        "stage4-shared-retention": (DESIGN, "| `etcd-s3-retention` | `5` (in S3, per server) |", "| `etcd-s3-retention` | `15` (in S3, per server) |"),
+        "stage4-compression-on": (DESIGN, "| `etcd-snapshot-compress` | `false`.", "| `etcd-snapshot-compress` | `true`."),
+        "stage4-config-secret": (DESIGN, "| `etcd-s3` | `true` |", "| `etcd-s3` | `true`; `etcd-s3-config-secret: etcd-s3` |"),
+        "stage4-encrypted-variables": (DESIGN, "rendered by homelab-k3s from a `0600` file in a private workstation tmpfs", "written by homelab-k3s from encrypted Ansible variables"),
+        "stage4-no-default-name-guard": (DESIGN, "a missing, default or differently prefixed name is refused", "a missing name is reported"),
+        "stage4-unscoped-listing-silent": (DESIGN, "The etcd identity can list every object **key name** in the backup bucket", "The etcd identity lists only its own prefix"),
+        "stage4-text-marker-search": (DESIGN, "counts exact occurrences of the marker's byte sequence", "counts its base64 rendering"),
+        "stage4-completion-without-aws-restore": (DESIGN, "Stage 4 is not complete until Track A restores a **real AWS object from `etcd/`**", "Stage 4 is complete once uploads appear under `etcd/`"),
     }
 
     for name, (target_name, old, new) in mutations.items():
@@ -38,6 +48,7 @@ def main() -> None:
                 "aws/backup/member-account.yaml",
                 "aws/backup/management-account.yaml",
                 "aws/backup/README.md",
+                DESIGN,
                 "scripts/validate-backup-infrastructure.py",
             ):
                 target = copy / relative

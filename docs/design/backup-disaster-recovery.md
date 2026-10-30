@@ -17,7 +17,7 @@ This design follows the safety model of the [Flux reconciliation-split design](f
 | Off-cluster target | One private, versioned S3 bucket in `us-east-1`, in the member account. Separate prefixes for etcd, volume backups, recovery material and evidence. |
 | Bucket encryption | Default **SSE-S3** (`AES256`). No customer-managed KMS key initially; see [Encryption](#encryption-sse-s3-first). |
 | Machine identities | Two dedicated IAM users, one for K3s etcd uploads and one for Velero, each limited to its own prefix. Static access keys, because the cluster is not EKS; see [Why static access keys](#why-static-access-keys). No personal SSO credentials, `AdministratorAccess` or root credentials are used by any automated process. |
-| etcd | Keep the existing K3s schedule (twice daily, five local snapshots per node) and add K3s's built-in S3 upload. Each snapshot is restorable only with the matching server token. |
+| etcd | Keep the twice-daily schedule and five local snapshots per node, under a node-specific Stage 4 base name, and add K3s's built-in S3 upload to one shared `etcd` folder, keeping five per node there. Each snapshot is restorable only with the matching server token. See [Stage 4](#stage-4-etcd-off-cluster-uploads-s4-0-design). |
 | Secret encryption at rest | **A separate prerequisite stage**, completed before any etcd snapshot leaves the cluster; see [Secrets encryption at rest](#secrets-encryption-at-rest-prerequisite-stage). |
 | Persistent volumes | Velero file-system backup with the Kopia uploader for the Prometheus and Grafana claims, **conditional on the rehearsal proving that it can read `local-path` volumes**. |
 | Recovery material | The K3s server token, the Grafana admin credential, the Velero repository password and (after the prerequisite stage) the K3s encryption configuration. Each is encrypted client-side with `age` to an offline-held key before upload, and is uploaded by a human administrator, never by a machine identity. |
@@ -243,7 +243,7 @@ The cluster runs on premises, not on EKS, so there is no IAM Roles for Service A
 
 Neither identity has console access, any other AWS permission, or access to `recovery/` or `evidence/`. `s3:DeleteObject` is needed because K3s and Velero prune their own backups; under versioning it only creates delete markers.
 
-The etcd identity policy, with placeholders:
+The etcd identity policy, with placeholders, as **deployed in Stage 1**:
 
 ```json
 {
@@ -266,7 +266,13 @@ The etcd identity policy, with placeholders:
 }
 ```
 
-The exact action set is confirmed during Stage 4 and Stage 5 preflight from `AccessDenied` errors, not widened by guesswork. If K3s or Velero makes a bucket-level call without a prefix (for example, a bucket-existence check), the condition is relaxed to `StringLikeIfExists`. That also allows an unprefixed listing of object names. Object names are designed to contain no secrets. Any widening beyond that is a design amendment.
+**K3s cannot use this condition as deployed.** It checks the bucket without a prefix and reconciles with prefix `etcd`, and both are denied. The approved change ([D2](#d2-identity-scope-option-1-accepted)) replaces the condition with:
+
+```json
+"Condition": { "StringLikeIfExists": { "s3:prefix": ["etcd", "etcd/*"] } }
+```
+
+It is made in gate S4-1 and deployed by an administrator in a later gate; until then the template is unchanged. It lets the etcd identity list every object key name in the bucket, but not read, write or delete anything outside `etcd/*`. The exact action set is otherwise confirmed from `AccessDenied` errors during the Stage 4 and Stage 5 rehearsals and preflights, not widened by guesswork. Velero is assessed separately at Stage 5. Any further widening is a design amendment.
 
 One shared etcd identity is used for all three servers. Per-node identities would give per-node attribution, but triple the rotation work for the same permissions; see [Open decisions](#open-decisions).
 
@@ -274,13 +280,13 @@ One shared etcd identity is used for all three servers. Per-node identities woul
 
 | Credential | Stored | Never stored |
 | --- | --- | --- |
-| etcd access key | On each server in a K3s configuration drop-in, `/etc/rancher/k3s/config.yaml.d/`, owned by root, mode `0600`, written by homelab-k3s from encrypted Ansible variables | Command-line flags (visible in the process list), systemd unit files, Git, logs, evidence |
+| etcd access key | On each server in a K3s configuration drop-in, `/etc/rancher/k3s/config.yaml.d/`, owned by root, mode `0600`, rendered by homelab-k3s from a `0600` file in a private workstation tmpfs ([D3](#d3-bucket-name-and-credentials)) | Command-line flags, extra-vars values, (visible in the process list), systemd unit files, Git, logs, evidence |
 | Velero access key | Kubernetes Secret in the `velero` namespace, created out of band like `monitoring/grafana-admin` | Git, Velero backups (Secrets are excluded), logs, evidence |
 | Velero repository password | Kubernetes Secret `velero/velero-repo-credentials`, created out of band **before the first backup** (otherwise Velero uses a publicly known default); an `age` copy in `recovery/` | Git, logs, evidence |
 
 Access keys are not part of the recovery material. After a disaster, the administrator issues new keys rather than recovering old ones.
 
-The Velero Secret, and the K3s configuration if it is stored in etcd in the installed version, are inside every etcd snapshot. That is acceptable only once Kubernetes Secret encryption is enabled, which is one reason it is a prerequisite. Stage 4 preflight confirms that the etcd access key does not appear in the `ETCDSnapshotFile` objects or the `k3s-etcd-snapshots` ConfigMap.
+The Velero Secret, and the K3s configuration if it is stored in etcd in the installed version, are inside every etcd snapshot. That is acceptable only once Kubernetes Secret encryption is enabled, which is one reason it is a prerequisite. In `v1.36.4+k3s1`, `ETCDSnapshotFile` records, which are stored in etcd, hold only the endpoint, bucket, region, folder and TLS options; K3s masks the key from them. The Stage 4 rehearsals and rollout still confirm, by count only, that no key-shaped string appears in those records, in the `k3s-etcd-snapshots` ConfigMap or in K3s's journal.
 
 Handling rules when a key is created:
 
@@ -336,31 +342,24 @@ Permission-set names may appear in Git. Account IDs, portal identifiers and pers
 
 ## etcd and K3s server token backup
 
-**Mechanism.** K3s's built-in S3 support uploads each scheduled snapshot after it is written locally. Configuration, in a drop-in managed by homelab-k3s:
+**Mechanism.** K3s's built-in S3 support uploads each snapshot after it is written locally. Every server uploads its own snapshots to one shared folder, so the bucket holds three copies of each point in time, and uploads continue while any one server is down. The configuration, the K3s behavior it relies on and the gates before it goes live are in [Stage 4: etcd off-cluster uploads](#stage-4-etcd-off-cluster-uploads-s4-0-design).
 
-| Setting | Value |
+**K3s behavior, from the `v1.36.4+k3s1` source.** Read at commit `4dedb15be78017a8ddd5b9e81acd44f3481078ed` and its pinned `minio-go` `v7.1.0`; each item is still proved in the [Stage 4 rehearsals](#stage-4-gates):
+
+| Behavior | Source finding |
 | --- | --- |
-| Snapshot schedule | Unchanged: `0 */12 * * *` (the existing twice-daily schedule) |
-| Local retention | Unchanged: 5 per node |
-| S3 upload | Enabled; bucket `<backup-bucket>`, region `us-east-1`, folder `etcd` |
-| Credentials | The etcd identity, from the `0600` drop-in |
-| Compression | Recommended: enable snapshot compression, which also changes the local snapshots; the restore rehearsal must use a compressed snapshot. See [Open decisions](#open-decisions) |
+| Options | All `etcd-s3-*` options used here exist, including `etcd-s3-retention` (default 5). If it is unset while `etcd-snapshot-retention` is set, S3 retention copies the local value, so both are set explicitly |
+| What is uploaded | Only the snapshot that the same save has just written. Existing local snapshots are never uploaded, by the schedule, reconciliation or anything else |
+| CLI snapshots | `k3s etcd-snapshot` reads the same `config.yaml` and `config.yaml.d/` drop-ins, so every CLI save uploads once S3 is configured. Its base name is always the CLI's `--name` (default `on-demand`); a configured `etcd-snapshot-name` does not apply to it |
+| Object keys | `<folder>/<base>-<node name>-<unix time>`, plus `.zip` when compressed, and `<folder>/.metadata/<same>` when the extra-metadata ConfigMap exists |
+| Retention | Local: files in the node's own directory whose names start with the base. S3: objects whose keys start with `<folder>/<base>`. Both are plain string prefixes with **no node filter**, so a base shared by several servers prunes across all of them |
+| Reconciliation | Every server lists the whole folder, and deletes `ETCDSnapshotFile` records for S3 objects missing from that listing. A shared folder keeps every server's view complete; per-node folders would make the servers delete each other's records |
+| S3 calls | Every new client sends `HEAD` on the bucket (`s3:ListBucket`, **no prefix**) and fails on any error except "no such bucket". Reconciliation lists with prefix `etcd`, retention with `etcd/<base>`. Uploads use `PutObject`, multipart from 16 MiB; reads, checks and pruning use `GetObject` and `DeleteObject` |
+| Credentials | A static key, else root's `~/.aws/credentials`, else instance metadata. The key is masked from `ETCDSnapshotFile` records. A 12-character SHA-256 prefix of the server token is recorded as a snapshot annotation and as S3 object metadata (`k3s-token-hash`). The bucket name appears in K3s's journal and records |
+| Reloading | Server-side S3 settings are read once at startup: scheduled snapshots need a K3s restart after any change. CLI saves read the drop-in on every run |
+| Schedule | The cron expression is evaluated in the node's local time zone |
 
-The intended outcome is that every server uploads its own snapshots, so the bucket holds three copies of each point in time and uploads continue while any one server is down. K3s is expected to prune S3 snapshots to the configured retention.
-
-**How K3s names, prunes and retains snapshots in S3 is not established fact in this design.** These are rehearsal assertions: each is tested in the Stage 4 k3d/MinIO rehearsal and confirmed against S3 after the Stage 4 live change. The observed behavior is recorded, and this design's retention, lifecycle and cost figures are amended if they differ.
-
-| Assertion | What is recorded |
-| --- | --- |
-| The installed version supports the options | `k3s server --help` on `v1.36.4+k3s1` lists the S3 and compression options used |
-| Object naming from three servers | Object keys from all three servers, showing whether names are distinct per server and what metadata objects K3s writes |
-| Per-node retention | Whether K3s applies retention per server or across all servers' snapshots in the folder |
-| Scheduled versus on-demand retention | Whether on-demand snapshots are pruned with scheduled ones, separately, or not at all |
-| Delete markers and noncurrent versions | That pruning creates delete markers and leaves noncurrent versions that the lifecycle rule expires after the configured period |
-| Noncurrent-version restore | An explicitly selected noncurrent version is copied back (or downloaded by version ID) and restored successfully ([Track A](#rehearsal-tracks)) |
-| S3 calls | The S3 calls K3s makes, as needed for the identity policy |
-
-**Token.** The server token is identical on all servers and is mode `0600`. Its recovery copy is `age` ciphertext in `recovery/`; see [Recovery material](#recovery-material-and-client-side-encryption). The token value, and any hash or fingerprint of it, are never printed, logged or recorded. Checks compare plaintext only by exit status (`cmp -s`), never by printing a digest.
+**Token.** The server token is identical on all servers and is mode `0600`. Its recovery copy is `age` ciphertext in `recovery/`; see [Recovery material](#recovery-material-and-client-side-encryption). The token value, and any hash or fingerprint of it, are never printed, logged or recorded by this project's tooling or evidence. Checks compare plaintext only by exit status (`cmp -s`), never by printing a digest. K3s itself stores a short token hash with each snapshot (see the table above), so evidence never captures `ETCDSnapshotFile` annotations or S3 object metadata (`x-amz-meta-*`).
 
 **Restore outline** (rehearsed in [Track A](#rehearsal-tracks)):
 
@@ -375,9 +374,152 @@ A restore from S3 directly through K3s's S3 options is also possible. It needs t
 **Interim manual p2 copy (before Stage 4).** Until Stage 4 uploads exist, the Stage 3 p2 (post-encryption) snapshot may be preserved once by hand as `age` ciphertext at `recovery/stage3-p2-snapshot/<YYYY-MM-DD>.age`, using the routine role ([runbook](../runbooks/encrypted-recovery-material.md#the-interim-manual-p2-snapshot-copy-stage3-p2-snapshot)). This is a deliberate exception to the prefix map: the snapshot goes under `recovery/`, where the routine role can write and current versions never expire, not under `etcd/`, which only the etcd machine identity writes.
 - **It is not a Stage 4 upload**, and does not test K3s's naming, pruning or retention.
 - **It is recorded separately** in the recovery-material inventory, not as a Stage 4 restore point.
-- **It is superseded** once a Stage 4 upload of a later snapshot is verified.
+- **It is superseded** only after [Track A](#rehearsal-tracks) restores a real Stage 4 object from `etcd/` (gate S4-7). Until then it stays the off-node post-encryption restore point.
 - **Restoring from it** follows the outline above, with the snapshot downloaded from `recovery/` and decrypted first. That path has not been rehearsed.
 - **Status:** made and verified once, on 2026-10-30, as `recovery/stage3-p2-snapshot/2026-10-29.age` ([validation record](../validation/encrypted-recovery-material.md#stage-3-the-interim-manual-p2-snapshot-copy-2026-10-30)). Stage 4 uploads remain pending.
+
+## Stage 4: etcd off-cluster uploads (S4-0 design)
+
+**Status: design approved (gate S4-0, 2026-10-30); nothing implemented.** This section records the S4-0 decisions D1 to D7 and the gates that follow. No K3s setting, CloudFormation change, Ansible code or access key exists for Stage 4 yet. The K3s behavior it relies on is listed under [etcd and K3s server token backup](#etcd-and-k3s-server-token-backup).
+
+### D1: naming and retention
+
+Each server has its own scheduled base name, in one shared folder:
+
+| Setting | Value |
+| --- | --- |
+| `etcd-snapshot-name` | `etcd-snapshot-s4-{{ inventory_hostname }}`, rendered per server |
+| `etcd-snapshot-retention` | `5` (local, per server) |
+| `etcd-s3-folder` | `etcd`, shared by all three servers |
+| `etcd-s3-retention` | `5` (in S3, per server) |
+
+**Resulting object keys:** `etcd/etcd-snapshot-s4-k3s01-k3s01-<unix time>`, and likewise for `k3s02` and `k3s03`. The repeated host name is K3s's own node suffix after the base. Metadata objects, if any, are `etcd/.metadata/<same>`.
+
+**Why this isolates the servers.** Retention matches keys starting with `etcd/etcd-snapshot-s4-<host>` in S3, and file names starting with `etcd-snapshot-s4-<host>` locally. With three distinct host names, none of which is a string prefix of another, each server keeps its own newest 5 and never prunes another server's snapshots. Reconciliation lists the whole `etcd` folder, so every server still sees all three servers' objects.
+
+**Why not the default or `etcd-snapshot-<host>`.** The default base `etcd-snapshot` would prune every server's objects in S3. `etcd-snapshot-<host>` would prefix-match the existing pre-Stage-4 scheduled files (`etcd-snapshot-<host>-<unix time>`) and prune them. Those files stay untouched, and outside K3s retention, until a separate retirement decision.
+
+**Compatibility.** The new names still match homelab-k3s's `^etcd-snapshot-` pattern, so its Stage 3 preservation checks keep classifying them as scheduled snapshots.
+
+**Required checks, static and in rehearsal:**
+- the three rendered prefixes do not overlap: none is a string prefix of another;
+- no existing local snapshot name on any server, and no existing key under `etcd/`, starts with any of the new prefixes;
+- every server's effective `etcd-snapshot-name`, across `config.yaml` and every drop-in, is exactly one value beginning with `etcd-snapshot-s4-`;
+- a missing, default or differently prefixed name is refused before any K3s restart and before any snapshot is created.
+
+**On-demand snapshots.** Routine Stage 4 checks pass a stable, node-specific base, `--name on-demand-s4-<host>`, so that retention applies per server. A CLI save without an explicit `--name` is refused by the tooling: the default `on-demand` is shared by every server, and prefix-matches earlier default-named on-demand files. Stage 3 checkpoints keep their unique names (`stage3-<checkpoint>-<UTC time>`) and are preserved separately. Once S3 is configured, they are uploaded too, and their unique bases mean S3 retention never prunes them.
+
+### D2: identity scope (Option 1, accepted)
+
+The deployed condition (`StringLike` `s3:prefix` `etcd/*`) denies both K3s calls that list without that prefix: the bucket check, which sends no prefix, and reconciliation, which sends `etcd`. K3s cannot start its S3 client until the condition changes.
+
+**Decision: keep the shared backup bucket and change the condition to `StringLikeIfExists` with `s3:prefix` `etcd` and `etcd/*`.** The CloudFormation change belongs to gate S4-1 and is deployed by an administrator in a later gate. Until then the template is unchanged.
+
+**Accepted consequence.** The etcd identity can list every object **key name** in the backup bucket, including names under `recovery/`, `evidence/` and, later, `volumes/`. It still cannot read, write or delete any object outside `etcd/*`, or list object versions, and every bucket-administration action stays denied. Object names are designed to contain only item names and dates, never secrets. A dedicated etcd bucket would avoid the visibility, at the cost of a second protected bucket, its lifecycle and procedures; it is reconsidered at Stage 5 if Velero needs the same widening.
+
+### D3: bucket name and credentials
+
+Nothing is committed:
+- **The bucket name** comes from the operator's existing `0600` bucket file.
+- **The access key** is created by an administrator in an SSO session, with the output written straight into a `0600` file in a private workstation tmpfs. A keep-alive runs in the operator's own terminal, swap is off and tracing is off. Nothing is printed.
+- **The drop-in** `/etc/rancher/k3s/config.yaml.d/30-etcd-s3.yaml`, root-owned `0600`, is rendered by homelab-k3s from that file:
+  - the playbook receives the file's path through an environment variable, never as an extra-vars value;
+  - the read and the write run with `no_log`, `diff: false` and `backup: false`;
+  - verification uses `stat` without checksums, and an allowlist of key names;
+  - the playbook refuses verbose, diff, check and debug modes.
+- **Not used:** `etcd-s3-config-secret`, which would put the key in etcd and in every snapshot; `AWS_*` environment files; and `/root/.aws`, which K3s would silently fall back to, so preflight requires that it is absent.
+- **Restarts and rotation.** Scheduled snapshots pick up a new key only after a K3s restart. CLI saves read the drop-in on every run, so a rotated key is proved with an on-demand save before the rolling restart. The old key is deactivated only after all three servers have restarted.
+- **Leak checks** (counts only, never values): key-shaped strings in the K3s journal, the K3s process's command line and environment, `ETCDSnapshotFile` records, the `k3s-etcd-snapshots` ConfigMap, Ansible output and evidence.
+
+### D4: remaining settings
+
+| Setting | Value |
+| --- | --- |
+| `etcd-snapshot-schedule-cron` | `0 */12 * * *`, set explicitly. Preflight confirms the servers' time zone is UTC |
+| `etcd-s3` | `true` |
+| `etcd-s3-region`, `etcd-s3-endpoint` | `us-east-1`, `s3.amazonaws.com` |
+| `etcd-s3-bucket-lookup-type`, `etcd-s3-timeout` | `auto`, `5m0s` |
+| `etcd-s3-proxy` | Unset, or `none` if preflight finds proxy variables |
+| `etcd-snapshot-compress` | `false`. Compression is deferred until a compressed restore has passed in rehearsal |
+
+### D5: no pre-encryption snapshot under `etcd/`
+
+- **By construction:** K3s uploads only the snapshot each save has just written, so nothing taken before S3 is configured is ever uploaded.
+- **Gates:** the enforced Stage 3 `enabled` validation passes on all three servers immediately before the drop-in is written and before each restart. The rollout refuses to continue if any server reports otherwise, or if any restore has happened since activation.
+- **After rollout:** every key under `etcd/` has a name timestamp and `LastModified` after the moment S3 was configured.
+- **Separation:** the bucket policy keeps the etcd identity away from `recovery/stage3-p2-snapshot/2026-10-29.age`. Under D2 it can see that object's name, but cannot read or change it.
+
+### D6: residual plaintext
+
+Encryption rewrites the current Secret records, but earlier revisions survive until compaction, and freed database pages keep their bytes until defragmentation. A post-encryption snapshot can therefore still hold plaintext Secret bytes, protected in S3 only by SSE-S3.
+
+**The test (disposable k3d with MinIO).** It uses a 32-byte random binary marker, M1, created into a private tmpfs file and never printed. A positive control, M2, is stored in a ConfigMap's `binaryData`, which is never encrypted. A negative control, M3, is never written. M1 is stored in a Secret created from a file (no last-applied annotation), so its protobuf record holds M1's raw bytes.
+- Every search reads the raw, uncompressed snapshot file as bytes and counts exact occurrences of the marker's byte sequence, not a text, base64 or hex rendering of it. It reports counts only, and runs on each member's snapshot.
+
+| Snapshot | Taken | Expected |
+| --- | --- | --- |
+| A | Before encryption | M1 at least once, M2 at least once, M3 never |
+| B | After enable, the one rotation and both restart rounds | M1 recorded |
+| C | After API-server compaction has passed the Secret's earlier revisions | M1 recorded |
+| D | After defragmenting each member in turn | **M1 never**, M2 at least once, M3 never |
+
+**Confirmation.** Snapshot D is restored onto an isolated single server with `--token-file`. Raw etcd inspection then shows:
+- the Secret's stored value starts with `k8s:enc:secretbox:v1:`;
+- reading an earlier revision fails as compacted;
+- an exact-byte count of M1 across the restored member's database file is zero;
+- the API readback of the Secret byte-matches M1, reported only by `cmp -s` exit status;
+- M2 is still present.
+
+**Decision rule.** If snapshot C already shows no M1, compaction alone suffices. Otherwise each live member is defragmented, one at a time, after compaction and immediately before the first upload, as a separately approved live step. Live residue cannot be measured without plaintext, so the live evidence is limited to each member's database size against its size in use, before and after.
+
+### D7: rehearsals, completion and freshness
+
+- **Before any live step:**
+  - **k3d with MinIO**, at `rancher/k3s:v1.36.4-k3s1`:
+    - a MinIO policy that reproduces both the deployed condition's failure and D2's success;
+    - D1's isolation, including a deliberate default-name failure;
+    - no backfill, on-demand inheritance and node-specific on-demand names;
+    - restart and rotation behavior;
+    - S3 unavailable and a wrong key;
+    - the leak checks and D6.
+  - **Three-VM rehearsal** under systemd against MinIO: the real playbooks, credential delivery, the rolling restart, a two-key rotation and rollback.
+  - **Isolated restore:**
+    - [Track A](#rehearsal-tracks) from a MinIO object with `--token-file`, including a noncurrent version;
+    - the path where every server is lost, using the token, the encryption-configuration copy and the interim p2 copy;
+    - D6's confirmation.
+- **Completion.** Stage 4 is not complete until Track A restores a **real AWS object from `etcd/`**, downloaded by version with the routine permission set onto isolated servers. Only then is the interim p2 copy marked superseded.
+- **Freshness.** Until external alert delivery exists, a weekly manual check runs with the routine permission set and records, by count and age only, the newest object for each server under `etcd/`, which must be under 14 hours old. Unattended operation is not claimed until then.
+- **Prerequisite.** The fresh-build secrets-encryption setting in homelab-k3s (`k3s_secrets_encryption_enabled`, default `false`) is resolved in its own pull request before Stage 4 implementation, because rebuilds and the restore rehearsals depend on it. It is not part of Stage 4.
+
+### Stage 4 gates
+
+Each gate needs its own approval, and none starts before the previous one has passed.
+
+1. **S4-0: research and design.** This section. Nothing implemented.
+2. **Review of S4-0.** Done, with D2 Option 1 chosen.
+3. **Prerequisite:** the fresh-build secrets-encryption setting, in its own homelab-k3s pull request.
+4. **S4-1: implementation and static tests.**
+   - homelab-k3s: the S3 drop-in role and playbooks, D1's name and prefix checks, node-specific on-demand names, D3's credential handling and leak checks, and their static tests.
+   - home-cluster: D2's condition change in CloudFormation, with validator and test updates, and the Stage 4 runbook.
+5. **S4-2: k3d with MinIO**, including D1, D2 and D6.
+6. **S4-3: three-VM rehearsal under systemd.**
+7. **S4-4: isolated restore**, including D6's confirmation.
+8. **S4-5: read-only live preflight:**
+   - versions, the UTC time zone, and each node name equal to its inventory host name;
+   - no `/root/.aws`; the proxy state;
+   - no existing file or key starting with a new prefix;
+   - each member's database size against its size in use;
+   - in AWS: the bucket configuration, an empty `etcd/`, and no access key on the etcd identity.
+9. **Stage 1 stack update** for D2, by an administrator, followed by a read-only check.
+10. **Live defragmentation, one member at a time**, only if D6 requires it.
+11. **S4-6: live rollout:**
+    - a fresh local snapshot;
+    - the key created; the drop-ins written;
+    - a serial restart, each server followed by a node-specific on-demand upload;
+    - the leak checks;
+    - the first scheduled cycle on all three servers;
+    - after at least three days, pruning, delete markers and noncurrent versions observed.
+12. **S4-7: restore of a real AWS object** in Track A. Then the interim p2 copy is marked superseded in the inventory, and the validation record is written.
 
 ## Secrets encryption at rest (prerequisite stage)
 
@@ -580,8 +722,8 @@ Before risky changes, on-demand snapshots continue to provide a fresher local re
 
 | Data | Frequency | Local retention | Off-cluster retention | Noncurrent history |
 | --- | --- | --- | --- | --- |
-| etcd snapshots | 00:00 and 12:00 node time, on each server | 5 per node (about 2.5 days) | Intended: 5 per node, pruned by K3s (rehearsal assertion) | 14 days (intended) |
-| On-demand etcd snapshots | Before risky changes | As K3s handles them (rehearsal assertion) | As K3s handles them (rehearsal assertion) | 14 days (intended) |
+| etcd snapshots | 00:00 and 12:00 node time (UTC, confirmed in preflight), on each server | 5 per node (about 2.5 days), base `etcd-snapshot-s4-<host>` | 5 per node, pruned by K3s per base ([D1](#d1-naming-and-retention); proved in rehearsal) | 14 days (intended) |
+| On-demand etcd snapshots | Before risky changes, and the Stage 4 checks | 5 per node and base; Stage 4 checks use `on-demand-s4-<host>` | The same, once S3 is configured; uniquely named Stage 3 checkpoints are never pruned | 14 days (intended) |
 | Prometheus volume | Daily 03:30 | None | 7 days (Velero TTL) | 7 days |
 | Grafana volume | Daily 03:30; weekly Sunday 04:30 | None | 7 days daily; 28 days weekly | 7 days |
 | Recovery material | On change; reviewed quarterly | Offline `age` identity only | Indefinite for the current version | 90 days |
@@ -707,7 +849,7 @@ This design proposes two changes, **which need approval**:
 | 1 | AWS storage and IAM | IaC template for the bucket, its policy, lifecycle and protections, the two IAM users and their policies. **No access keys.** The definition of the routine least-privilege permission set ([Human access](#human-access)). Static checks for account IDs and key patterns | Bucket and IAM users created through the existing administrator session; the routine permission set created or approved |
 | 2 | Encrypted recovery material | The [runbook](../runbooks/encrypted-recovery-material.md); helper scripts to encrypt and verify on the source host and to upload and download with the routine role; the blank inventory template; static checks; the public `age` recipient | Ciphertext of the token, the Grafana credential and the filled inventory uploaded, downloaded and verified |
 | 3 | Secrets encryption at rest | homelab-k3s server configuration; the documented K3s procedure for `v1.36.4+k3s1`, recorded step by step; runbook and evidence here | The rehearsed multi-server procedure (enable, re-encrypt, one key rotation); encryption-recovery material added to the recovery material if separately required |
-| 4 | etcd off-cluster backups | homelab-k3s drop-in for S3 upload (credentials from encrypted variables); the freshness rule here, if the observability Phase 4 custom-resource metrics exist | Etcd access key created; snapshots uploaded |
+| 4 | etcd off-cluster backups | Per the [Stage 4 gates](#stage-4-gates): homelab-k3s drop-in for S3 upload, with credentials from a private tmpfs file ([D3](#d3-bucket-name-and-credentials)); here, D2's identity-condition change and the Stage 4 runbook; the freshness rule, if the observability Phase 4 custom-resource metrics exist | Etcd access key created; snapshots uploaded |
 | 5 | Volume backups | `backup.yaml` and `clusters/home/backup/`; CI catalog update for Velero CRDs; Pod Security and RBAC checks | Velero installed; Velero key and repository password created out of band beforehand; schedules start |
 | 6 | Restore rehearsal | None, or harness fixes outside the repository | Isolated environment only; see [Isolated restore rehearsal](#isolated-restore-rehearsal) |
 | 7 | Evidence and documentation | `docs/validation/backup-disaster-recovery.md` and README status, limited to the evidence | None |
@@ -740,7 +882,7 @@ Static checks do not show S3 behavior, IAM sufficiency or recoverability.
 The rehearsal uses MinIO in the k3d cluster as the S3-compatible target, so no AWS credentials enter it.
 
 - **Stage 3:** a three-server k3d cluster at the same K3s version. Execute the exact documented procedure recorded in the Stage 3 PR: enable, re-encrypt, one rotation, and rollback. Record each server's status and the restarts each step needed, and restore pre- and post-rotation snapshots with the matching token.
-- **Stage 4:** K3s uploads to MinIO, retention pruning and restore from an uploaded snapshot.
+- **Stage 4:** K3s uploads to MinIO, per-node retention and restore from an uploaded snapshot, with the full scope in [D7](#d7-rehearsals-completion-and-freshness); followed by the three-VM rehearsal and the isolated restore.
 - **Stage 5, on the same `local-path` provisioner:**
   - the volume-type question above;
   - backup and restore of both claims;
@@ -800,8 +942,9 @@ Evidence boundaries: k3d and MinIO do not test AWS IAM evaluation, bucket polici
 - All Kustomizations are `Ready=True` at the merge revision.
 - The LAN monitor stayed clean through the change window.
 - **Stage 4:**
-  - an on-demand snapshot and the next scheduled snapshot appear under `etcd/` from each server;
-  - the retention assertions from Stage 4 (naming, per-node retention, on-demand handling, delete markers and noncurrent versions) are recorded as observed in S3;
+  - a node-specific on-demand snapshot and the next scheduled snapshot appear under `etcd/` from each server, all newer than the moment S3 was configured;
+  - D1's naming and per-node retention, on-demand handling, delete markers and noncurrent versions are recorded as observed in S3;
+  - the pre-Stage-4 local snapshots are unchanged;
   - no key-shaped string appears in the K3s journal.
 - **Stage 5:**
   - the storage location is `Available`;
@@ -946,8 +1089,8 @@ Do **not** claim:
    - `--token-file` with cluster reset;
    - a documented multi-server procedure for enabling Secret encryption, re-encrypting and rotating keys.
 
-   Each is verified against `v1.36.4+k3s1`, not assumed from documentation of other versions.
-3. K3s does not store the S3 access key in etcd objects (`ETCDSnapshotFile`, the `k3s-etcd-snapshots` ConfigMap).
+   Each is verified against `v1.36.4+k3s1`, not assumed from documentation of other versions. The S3 options, retention and naming were read from that version's source in S4-0 (see [etcd and K3s server token backup](#etcd-and-k3s-server-token-backup)), and are still proved in the Stage 4 rehearsals.
+3. K3s does not store the S3 access key in etcd objects (`ETCDSnapshotFile`, the `k3s-etcd-snapshots` ConfigMap). The `v1.36.4+k3s1` source masks it; the rehearsals confirm it by count.
 4. K3s bootstrap data in a snapshot includes the encryption configuration, so a token-matched restore recovers it. The separate recovery copy is a safeguard.
 5. The `local-path` claims are `hostPath` volumes (the provisioner's default). If so, Velero file-system backup may not support them.
 6. Snapshot sizes and Kopia repository growth are within the cost-model assumptions. Both are measured.
@@ -973,9 +1116,13 @@ Do **not** claim:
    - the isolated network design;
    - for Track B and Track C, S3 egress with a read-only identity (recommended, because it tests the real AWS path), or a local S3-compatible copy.
 9. **Prometheus volume backup:** keep it, if the rehearsal proves it works, at about $0.37 a month of the estimate; or accept losing up to 7 days of metrics and back up Grafana only.
-10. **etcd snapshot compression:** enable it (recommended) and rehearse a compressed restore.
+10. **etcd snapshot compression:** deferred (S4-0). Stage 4 starts uncompressed; compression is reconsidered only after a compressed restore has passed in rehearsal.
 11. **S3 Object Lock:** reconsider in governance mode after the first rehearsal.
 12. **Logging:** CloudTrail data events for `recovery/` only (low volume, small cost), or none. Confirm whether an organization trail already records management events for the member account.
 13. **Routine permission-set details:** resolved for Stage 1 — the least-privilege action list is defined in CloudFormation, and the rehearsal-only identity remains an administrator task.
 14. **Offline storage of the `age` identity:** resolved — Recovery A is kept locally and Recovery B off-site, with a passphrase-encrypted online copy in addition; see [Recovery material](#recovery-material-and-client-side-encryption). The off-site location and its holder are not recorded in Git.
 15. **Cost guard:** whether to add an S3-filtered budget, for example $2, in the management account, in addition to the organization-wide $10 budget.
+16. **etcd identity listing scope:** resolved (S4-0) — keep the shared bucket and accept that the etcd identity can list every object key name; see [D2](#d2-identity-scope-option-1-accepted).
+17. **etcd snapshot naming and retention:** resolved (S4-0) — the node-specific base `etcd-snapshot-s4-<host>` in one shared `etcd` folder, with 5 per node locally and in S3; see [D1](#d1-naming-and-retention).
+18. **Residual plaintext in post-encryption snapshots:** open until the D6 rehearsal; it decides whether the live members are defragmented before the first upload.
+19. **Retirement of the pre-Stage-4 local snapshots:** separate decision; Stage 4 leaves them untouched.

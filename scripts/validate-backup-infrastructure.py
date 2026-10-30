@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed static checks for the Stage 1 CloudFormation templates."""
+"""Fail-closed static checks for the Stage 1 CloudFormation templates and the Stage 4 design decisions."""
 
 from pathlib import Path
 import re
@@ -9,12 +9,50 @@ ROOT = Path(__file__).resolve().parents[1]
 MEMBER = ROOT / "aws/backup/member-account.yaml"
 MANAGEMENT = ROOT / "aws/backup/management-account.yaml"
 README = ROOT / "aws/backup/README.md"
-FILES = (MEMBER, MANAGEMENT, README)
+DESIGN = ROOT / "docs/design/backup-disaster-recovery.md"
+FILES = (MEMBER, MANAGEMENT, README, DESIGN)
+
+# Approved S4-0 decisions that the design must keep stating.
+STAGE4_REQUIRED = (
+    "## Stage 4: etcd off-cluster uploads (S4-0 design)",
+    "| `etcd-snapshot-name` | `etcd-snapshot-s4-{{ inventory_hostname }}`, rendered per server |",
+    "| `etcd-snapshot-retention` | `5` (local, per server) |",
+    "| `etcd-s3-folder` | `etcd`, shared by all three servers |",
+    "| `etcd-s3-retention` | `5` (in S3, per server) |",
+    "| `etcd-snapshot-compress` | `false`.",
+    "`--name on-demand-s4-<host>`",
+    "A CLI save without an explicit `--name` is refused by the tooling",
+    "a missing, default or differently prefixed name is refused before any K3s restart and before any snapshot is created",
+    '"Condition": { "StringLikeIfExists": { "s3:prefix": ["etcd", "etcd/*"] } }',
+    "The etcd identity can list every object **key name** in the backup bucket",
+    "It still cannot read, write or delete any object outside `etcd/*`",
+    "counts exact occurrences of the marker's byte sequence",
+    "Stage 4 is not complete until Track A restores a **real AWS object from `etcd/`**",
+    "a weekly manual check runs with the routine permission set",
+    "1. **S4-0: research and design.** This section. Nothing implemented.",
+)
+# Rejected or superseded choices that must not return.
+STAGE4_FORBIDDEN = (
+    "etcd-snapshot-{{ inventory_hostname }}",
+    "`etcd-s3-retention` | `15`",
+    "etcd-s3-config-secret:",
+    "encrypted Ansible variables",
+    "credentials from encrypted variables",
+    "enable it (recommended) and rehearse a compressed restore",
+)
 
 
 def require(text: str, token: str, path: Path) -> None:
     if token not in text:
         raise AssertionError(f"{path}: missing required token: {token}")
+
+
+def check_stage4_design(text: str) -> None:
+    for token in STAGE4_REQUIRED:
+        require(text, token, DESIGN)
+    for forbidden in STAGE4_FORBIDDEN:
+        if forbidden in text:
+            raise AssertionError(f"{DESIGN}: rejected Stage 4 choice present: {forbidden}")
 
 
 def main() -> int:
@@ -87,7 +125,9 @@ def main() -> int:
         if forbidden in management:
             raise AssertionError(f"{MANAGEMENT}: routine operator is over-privileged: {forbidden}")
 
-    print("Stage 1 backup infrastructure checks passed")
+    check_stage4_design(texts[DESIGN])
+
+    print("Stage 1 backup infrastructure and Stage 4 design checks passed")
     return 0
 
 
