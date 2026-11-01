@@ -34,3 +34,13 @@ Stack deletion is intentionally non-routine. The bucket and bucket policy are
 retained, and the policy denies bucket deletion. Teardown requires a separately
 reviewed destructive procedure that first preserves or deliberately removes all
 object versions and then changes the deny policy.
+
+## Stage 4 change (S4-1, not deployed)
+
+`member-account.yaml` changes the etcd identity's listing condition to
+`StringLikeIfExists` with `s3:prefix` `etcd` and `etcd/*`, as decided in D2 of
+the Stage 4 design. K3s checks the bucket with no prefix and reconciles with
+prefix `etcd`, which the Stage 1 condition denies. The object grants are
+unchanged. Until an administrator deploys it at gate 9, the template differs
+from the deployed stack. The deployment and its read-only checks, including
+the policy simulation, are in `docs/runbooks/etcd-s3-uploads.md`.

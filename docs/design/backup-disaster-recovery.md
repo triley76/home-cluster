@@ -238,7 +238,7 @@ The cluster runs on premises, not on EKS, so there is no IAM Roles for Service A
 
 | Identity | Used by | Grants (identity policy) |
 | --- | --- | --- |
-| `home-cluster-etcd-backup` | K3s on all three servers | `s3:ListBucket` on the bucket with `s3:prefix` limited to `etcd/*`; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` on `etcd/*` |
+| `home-cluster-etcd-backup` | K3s on all three servers | `s3:ListBucket` on the bucket, deployed with `s3:prefix` limited to `etcd/*` and changed in S4-1 to `StringLikeIfExists` `etcd` and `etcd/*` ([D2](#d2-identity-scope-option-1-accepted)); `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts` on `etcd/*` |
 | `home-cluster-velero` | Velero server and node-agent | `s3:ListBucket` with `s3:prefix` limited to `volumes/*`; `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts` on `volumes/*` |
 
 Neither identity has console access, any other AWS permission, or access to `recovery/` or `evidence/`. `s3:DeleteObject` is needed because K3s and Velero prune their own backups; under versioning it only creates delete markers.
@@ -259,7 +259,7 @@ The etcd identity policy, with placeholders, as **deployed in Stage 1**:
     {
       "Sid": "ReadWriteEtcdObjects",
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
       "Resource": "arn:aws:s3:::<backup-bucket>/etcd/*"
     }
   ]
@@ -272,7 +272,7 @@ The etcd identity policy, with placeholders, as **deployed in Stage 1**:
 "Condition": { "StringLikeIfExists": { "s3:prefix": ["etcd", "etcd/*"] } }
 ```
 
-It is made in gate S4-1 and deployed by an administrator in a later gate; until then the template is unchanged. It lets the etcd identity list every object key name in the bucket, but not read, write or delete anything outside `etcd/*`. The exact action set is otherwise confirmed from `AccessDenied` errors during the Stage 4 and Stage 5 rehearsals and preflights, not widened by guesswork. Velero is assessed separately at Stage 5. Any further widening is a design amendment.
+It is made in gate S4-1 and deployed by an administrator at gate 9 of the [Stage 4 gates](#stage-4-gates). Until gate 9, the template in this repository differs from the deployed stack: the template has the new condition, the stack still has the old one. The object grants were not changed in S4-1; the Stage 1 policy above and the template have always included `s3:ListMultipartUploadParts`, which earlier versions of the table omitted. It lets the etcd identity list every object key name in the bucket, but not read, write or delete anything outside `etcd/*`. The exact action set is otherwise confirmed from `AccessDenied` errors during the Stage 4 and Stage 5 rehearsals and preflights, not widened by guesswork. Velero is assessed separately at Stage 5. Any further widening is a design amendment.
 
 One shared etcd identity is used for all three servers. Per-node identities would give per-node attribution, but triple the rotation work for the same permissions; see [Open decisions](#open-decisions).
 
@@ -380,7 +380,14 @@ A restore from S3 directly through K3s's S3 options is also possible. It needs t
 
 ## Stage 4: etcd off-cluster uploads (S4-0 design)
 
-**Status: design approved (gate S4-0, 2026-10-30); nothing implemented.** This section records the S4-0 decisions D1 to D7 and the gates that follow. No K3s setting, CloudFormation change, Ansible code or access key exists for Stage 4 yet. The K3s behavior it relies on is listed under [etcd and K3s server token backup](#etcd-and-k3s-server-token-backup).
+**Status: S4-1 implemented (static tests only); the template change is not deployed.** The design was approved at gate S4-0 on 2026-10-30. This section records the S4-0 decisions D1 to D7, the S4-1 decisions and the gates that follow. S4-1 added D2's condition to the CloudFormation template, with validator and mutation tests, the [Stage 4 runbook](../runbooks/etcd-s3-uploads.md), and, in homelab-k3s, the `etcd-s3` role, its playbooks and static tests. No access key exists, the stack has not been updated, and nothing has run against a node or AWS. The K3s behavior it relies on is listed under [etcd and K3s server token backup](#etcd-and-k3s-server-token-backup).
+
+### S4-1 decisions
+
+1. **The etcd identity's object grants are unchanged.** S4-1 changes only the listing condition. The template has always granted `s3:ListMultipartUploadParts` on `etcd/*`; the identity table and the Stage 1 policy now say so.
+2. **Snapshots that K3s retains are outside the Stage 3 preservation baseline.** The Stage 3 pattern for snapshots pruned by K3s's own retention is `^(etcd-snapshot-|on-demand-s4-)`. Without it, the first time K3s pruned an `on-demand-s4-<host>` file, every later Stage 3 gate would report it missing. Default-named `on-demand-*` files, `stage3-*` checkpoints and every other name stay tracked.
+3. **Fresh builds never configure uploads.** `site.yml`, the build playbooks and the fresh-build setting are unchanged. Only the Stage 4 playbooks write the S3 drop-in, behind the enforced Stage 3 `enabled` validation. A rebuilt or restored cluster, including one restored from the pre-encryption checkpoint, therefore uploads nothing until a separately approved Stage 4 run.
+4. **Integrity is never claimed from an ETag.** Every upload integrity check compares content by exit status, without printing a digest or size. A check whose method has not been rehearsal-approved fails closed, and so does any unknown or unsupported remote-checksum behavior. No method is approved until S4-2 records one.
 
 ### D1: naming and retention
 
@@ -413,7 +420,7 @@ Each server has its own scheduled base name, in one shared folder:
 
 The deployed condition (`StringLike` `s3:prefix` `etcd/*`) denies both K3s calls that list without that prefix: the bucket check, which sends no prefix, and reconciliation, which sends `etcd`. K3s cannot start its S3 client until the condition changes.
 
-**Decision: keep the shared backup bucket and change the condition to `StringLikeIfExists` with `s3:prefix` `etcd` and `etcd/*`.** The CloudFormation change belongs to gate S4-1 and is deployed by an administrator in a later gate. Until then the template is unchanged.
+**Decision: keep the shared backup bucket and change the condition to `StringLikeIfExists` with `s3:prefix` `etcd` and `etcd/*`.** The CloudFormation change was made in gate S4-1 and is deployed by an administrator at gate 9.
 
 **Accepted consequence.** The etcd identity can list every object **key name** in the backup bucket, including names under `recovery/`, `evidence/` and, later, `volumes/`. It still cannot read, write or delete any object outside `etcd/*`, or list object versions, and every bucket-administration action stays denied. Object names are designed to contain only item names and dates, never secrets. A dedicated etcd bucket would avoid the visibility, at the cost of a second protected bucket, its lifecycle and procedures; it is reconsidered at Stage 5 if Velero needs the same widening.
 
@@ -426,7 +433,8 @@ Nothing is committed:
   - the playbook receives the file's path through an environment variable, never as an extra-vars value;
   - the read and the write run with `no_log`, `diff: false` and `backup: false`;
   - verification uses `stat` without checksums, and an allowlist of key names;
-  - the playbook refuses verbose, diff, check and debug modes.
+  - the playbook refuses verbose, diff, check and debug modes;
+  - **the drop-in holds the key persistently.** It stays on each server's disk, readable only by root (and so by K3s), until a rotation replaces it or the drop-in is removed. Anyone with root on a server, or with that server's disk, has the key.
 - **Not used:** `etcd-s3-config-secret`, which would put the key in etcd and in every snapshot; `AWS_*` environment files; and `/root/.aws`, which K3s would silently fall back to, so preflight requires that it is absent.
 - **Restarts and rotation.** Scheduled snapshots pick up a new key only after a K3s restart. CLI saves read the drop-in on every run, so a rotated key is proved with an on-demand save before the rolling restart. The old key is deactivated only after all three servers have restarted.
 - **Leak checks** (counts only, never values): key-shaped strings in the K3s journal, the K3s process's command line and environment, `ETCDSnapshotFile` records, the `k3s-etcd-snapshots` ConfigMap, Ansible output and evidence.
@@ -510,7 +518,7 @@ Each gate needs its own approval, and none starts before the previous one has pa
    - no existing file or key starting with a new prefix;
    - each member's database size against its size in use;
    - in AWS: the bucket configuration, an empty `etcd/`, and no access key on the etcd identity.
-9. **Stage 1 stack update** for D2, by an administrator, followed by a read-only check.
+9. **Stage 1 stack update** for D2, by an administrator, followed by a read-only check. The check includes an IAM policy simulation of the etcd identity, with the bucket policy as the resource policy, because the MinIO rehearsals may not model `StringLikeIfExists` exactly as AWS does. It is the first AWS-side proof of D2, and needs no access key.
 10. **Live defragmentation, one member at a time**, only if D6 requires it.
 11. **S4-6: live rollout:**
     - a fresh local snapshot;
