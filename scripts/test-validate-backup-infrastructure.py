@@ -8,6 +8,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = ROOT / "scripts/validate-backup-infrastructure.py"
 DESIGN = "docs/design/backup-disaster-recovery.md"
+MEMBER = "aws/backup/member-account.yaml"
 
 
 def run(root: Path) -> subprocess.CompletedProcess[str]:
@@ -39,6 +40,19 @@ def main() -> None:
         "stage4-unscoped-listing-silent": (DESIGN, "The etcd identity can list every object **key name** in the backup bucket", "The etcd identity lists only its own prefix"),
         "stage4-text-marker-search": (DESIGN, "counts exact occurrences of the marker's byte sequence", "counts its base64 rendering"),
         "stage4-completion-without-aws-restore": (DESIGN, "Stage 4 is not complete until Track A restores a **real AWS object from `etcd/`**", "Stage 4 is complete once uploads appear under `etcd/`"),
+        "s41-condition-reverted": (MEMBER, "StringLikeIfExists:\n                    s3:prefix:\n                      - etcd\n", "StringLike:\n                    s3:prefix:\n                      - etcd\n"),
+        "s41-reconcile-prefix-dropped": (MEMBER, "                      - etcd\n                      - etcd/*\n", "                      - etcd/*\n"),
+        "s41-wildcard-prefix": (MEMBER, "                      - etcd/*\n              - Sid: ManageEtcdObjects", "                      - etcd/*\n                      - '*'\n              - Sid: ManageEtcdObjects"),
+        "s41-recovery-prefix": (MEMBER, "                      - etcd/*\n              - Sid: ManageEtcdObjects", "                      - etcd/*\n                      - recovery/*\n              - Sid: ManageEtcdObjects"),
+        "s41-velero-ifexists": (MEMBER, "                  StringLike:\n                    s3:prefix:\n                      - volumes/*", "                  StringLikeIfExists:\n                    s3:prefix:\n                      - volumes/*"),
+        "s41-object-resource-widened": (MEMBER, "Resource: !Sub '${BackupBucket.Arn}/etcd/*'\n\n  VeleroBackupUser", "Resource: !Sub '${BackupBucket.Arn}/*'\n\n  VeleroBackupUser"),
+        "s41-get-object-version": (MEMBER, "                  - s3:GetObject\n                  - s3:ListMultipartUploadParts", "                  - s3:GetObject\n                  - s3:GetObjectVersion\n                  - s3:ListMultipartUploadParts"),
+        "s41-list-bucket-versions": (MEMBER, "                Action: s3:ListBucket\n                Resource: !GetAtt BackupBucket.Arn\n                Condition:\n                  StringLikeIfExists", "                Action:\n                  - s3:ListBucket\n                  - s3:ListBucketVersions\n                Resource: !GetAtt BackupBucket.Arn\n                Condition:\n                  StringLikeIfExists"),
+        "s41-extra-etcd-statement": (MEMBER, "                Resource: !Sub '${BackupBucket.Arn}/etcd/*'\n\n  VeleroBackupUser", "                Resource: !Sub '${BackupBucket.Arn}/etcd/*'\n              - Sid: ExtraEtcdGrant\n                Effect: Allow\n                Action: s3:GetBucketLocation\n                Resource: !GetAtt BackupBucket.Arn\n\n  VeleroBackupUser"),
+        "s41-etcd-deny-widened": (MEMBER, "            NotResource: !Sub '${BackupBucket.Arn}/etcd/*'", "            NotResource: !Sub '${BackupBucket.Arn}/*'"),
+        "s41-design-status": (DESIGN, "**Status: S4-1 implemented (static tests only); the template change is not deployed.**", "**Status: S4-1 deployed.**"),
+        "s41-design-action-list": (DESIGN, "`s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts` on `etcd/*`", "`s3:AbortMultipartUpload` on `etcd/*`"),
+        "s41-design-deployed-note": (DESIGN, "Until gate 9, the template in this repository differs from the deployed stack", "The template matches the deployed stack"),
     }
 
     for name, (target_name, old, new) in mutations.items():

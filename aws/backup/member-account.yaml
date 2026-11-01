@@ -83,8 +83,9 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt BackupBucket.Arn
                 Condition:
-                  StringLike:
+                  StringLikeIfExists:
                     s3:prefix:
+                      - etcd
                       - etcd/*
               - Sid: ManageEtcdObjects
                 Effect: Allow

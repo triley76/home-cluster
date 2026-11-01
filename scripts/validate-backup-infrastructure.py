@@ -31,6 +31,65 @@ STAGE4_REQUIRED = (
     "a weekly manual check runs with the routine permission set",
     "1. **S4-0: research and design.** This section. Nothing implemented.",
 )
+# S4-1 (D2, Option 1): the etcd identity's whole policy, exactly. The prefix-less
+# bucket check and the reconcile listing (prefix etcd) need IfExists and both
+# prefixes; objects stay limited to etcd/*. Any widening is a design amendment.
+ETCD_POLICY = """\
+      Policies:
+        - PolicyName: home-cluster-etcd-prefix
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListEtcdPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLikeIfExists:
+                    s3:prefix:
+                      - etcd
+                      - etcd/*
+              - Sid: ManageEtcdObjects
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/etcd/*'
+"""
+# Velero keeps the Stage 1 condition until Stage 5 assesses it.
+VELERO_LIST = """\
+              - Sid: ListVolumesPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - volumes/*
+              - Sid: ManageVolumeObjects
+"""
+ETCD_DENY = """\
+          - Sid: DenyEtcdUserOutsideEtcd
+            Effect: Deny
+            Principal:
+              AWS: !GetAtt EtcdBackupUser.Arn
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            NotResource: !Sub '${BackupBucket.Arn}/etcd/*'
+"""
+# The design must keep the S4-1 state and the corrected action list.
+STAGE4_S41_REQUIRED = (
+    "**Status: S4-1 implemented (static tests only); the template change is not deployed.**",
+    "`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts` on `etcd/*`",
+    "Until gate 9, the template in this repository differs from the deployed stack",
+)
 # Rejected or superseded choices that must not return.
 STAGE4_FORBIDDEN = (
     "etcd-snapshot-{{ inventory_hostname }}",
@@ -47,8 +106,27 @@ def require(text: str, token: str, path: Path) -> None:
         raise AssertionError(f"{path}: missing required token: {token}")
 
 
+def resource_block(member: str, name: str) -> str:
+    match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z]|^[A-Za-z]|\Z)", member, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise AssertionError(f"{MEMBER}: resource {name} not found")
+    return match.group(1)
+
+
+def check_stage4_identity(member: str) -> None:
+    etcd = resource_block(member, "EtcdBackupUser")
+    if not etcd.rstrip("\n").endswith(ETCD_POLICY.rstrip("\n")) or etcd.count("- Sid:") != 2:
+        raise AssertionError(f"{MEMBER}: the etcd identity policy is not exactly the approved S4-1 policy")
+    if VELERO_LIST not in resource_block(member, "VeleroBackupUser"):
+        raise AssertionError(f"{MEMBER}: the Velero listing condition changed")
+    if ETCD_DENY not in resource_block(member, "BackupBucketPolicy"):
+        raise AssertionError(f"{MEMBER}: the deny for the etcd identity outside etcd/* is missing or changed")
+    if member.count("IfExists") != 1:
+        raise AssertionError(f"{MEMBER}: IfExists is approved only for the etcd listing condition")
+
+
 def check_stage4_design(text: str) -> None:
-    for token in STAGE4_REQUIRED:
+    for token in STAGE4_REQUIRED + STAGE4_S41_REQUIRED:
         require(text, token, DESIGN)
     for forbidden in STAGE4_FORBIDDEN:
         if forbidden in text:
@@ -102,6 +180,7 @@ def main() -> int:
     for forbidden in ("AWS::IAM::AccessKey", "LoginProfile:", "aws:kms", "SSEAlgorithm: aws:kms"):
         if forbidden in member:
             raise AssertionError(f"{MEMBER}: forbidden token: {forbidden}")
+    check_stage4_identity(member)
 
     management = texts[MANAGEMENT]
     for token in (
