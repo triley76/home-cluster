@@ -288,6 +288,8 @@ Access keys are not part of the recovery material. After a disaster, the adminis
 
 The Velero Secret, and the K3s configuration if it is stored in etcd in the installed version, are inside every etcd snapshot. That is acceptable only once Kubernetes Secret encryption is enabled, which is one reason it is a prerequisite. In `v1.36.4+k3s1`, `ETCDSnapshotFile` records, which are stored in etcd, hold only the endpoint, bucket, region, folder and TLS options; K3s masks the key from them. The Stage 4 rehearsals and rollout still confirm, by count only, that no key-shaped string appears in those records, in the `k3s-etcd-snapshots` ConfigMap or in K3s's journal.
 
+K3s also records its server arguments, including the bucket name, in the `k3s.io/node-args` annotation on each Node. The S4-2 rehearsal observed this annotation on all three Nodes. Node objects and `ETCDSnapshotFile` records are stored in etcd, so the bucket name may also be present in etcd snapshots, local and uploaded; snapshot contents were not inspected, so that remains unverified. This is accepted: the bucket name is an identifier, not a secret ([Open decisions](#open-decisions), item 4). The handling rule is unchanged: tooling and exported evidence never print or record the bucket name (the Stage 4 runbook's rules for every step), and never retain or export raw Node annotations, `ETCDSnapshotFile` records or S3 object metadata. Transient presence-only checks that emit only counts or presence are allowed.
+
 Handling rules when a key is created:
 
 - The administrator creates the key in an SSO session. The CLI output is redirected straight into a `0600` file in tmpfs, never to the terminal, a log or persistent disk.
@@ -355,7 +357,7 @@ Permission-set names may appear in Git. Account IDs, portal identifiers and pers
 | Retention | Local: files in the node's own directory whose names start with the base. S3: objects whose keys start with `<folder>/<base>`. Both are plain string prefixes with **no node filter**, so a base shared by several servers prunes across all of them |
 | Reconciliation | Every server lists the whole folder, and deletes `ETCDSnapshotFile` records for S3 objects missing from that listing. A shared folder keeps every server's view complete; per-node folders would make the servers delete each other's records |
 | S3 calls | Every new client sends `HEAD` on the bucket (`s3:ListBucket`, **no prefix**) and fails on any error except "no such bucket". Reconciliation lists with prefix `etcd`, retention with `etcd/<base>`. Uploads use `PutObject`, multipart from 16 MiB; reads, checks and pruning use `GetObject` and `DeleteObject` |
-| Credentials | A static key, else root's `~/.aws/credentials`, else instance metadata. The key is masked from `ETCDSnapshotFile` records. A 12-character SHA-256 prefix of the server token is recorded as a snapshot annotation and as S3 object metadata (`k3s-token-hash`). The bucket name appears in K3s's journal and records |
+| Credentials | A static key, else root's `~/.aws/credentials`, else instance metadata. The key is masked from `ETCDSnapshotFile` records. A 12-character SHA-256 prefix of the server token is recorded as a snapshot annotation and as S3 object metadata (`k3s-token-hash`). The bucket name appears in K3s's journal and records, and in the `k3s.io/node-args` annotation on each Node (observed on all three Nodes in the S4-2 rehearsal; no S3 key, token or other rehearsal secret was found in the Node objects, by count only) |
 | Reloading | Server-side S3 settings are read once at startup: scheduled snapshots need a K3s restart after any change. CLI saves read the drop-in on every run |
 | Schedule | The cron expression is evaluated in the node's local time zone |
 
@@ -438,6 +440,7 @@ Nothing is committed:
 - **Not used:** `etcd-s3-config-secret`, which would put the key in etcd and in every snapshot; `AWS_*` environment files; and `/root/.aws`, which K3s would silently fall back to, so preflight requires that it is absent.
 - **Restarts and rotation.** Scheduled snapshots pick up a new key only after a K3s restart. CLI saves read the drop-in on every run, so a rotated key is proved with an on-demand save before the rolling restart. The old key is deactivated only after all three servers have restarted.
 - **Leak checks** (counts only, never values): key-shaped strings in the K3s journal, the K3s process's command line and environment, `ETCDSnapshotFile` records, the `k3s-etcd-snapshots` ConfigMap, Ansible output and evidence.
+- **The bucket name in K3s's own output and state** (its journal, `ETCDSnapshotFile` records and the `k3s.io/node-args` Node annotation) is expected and is not a leak. This project's tooling and evidence still never print or record the bucket name, and the leak checks above stay key-shaped.
 
 ### D4: remaining settings
 
